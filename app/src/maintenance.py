@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import gzip
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -28,11 +28,23 @@ LOCK_FILE = kh.DATA_ROOT / "maintenance.lock"
 def lock():
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.parent.chmod(0o700)
-    handle = LOCK_FILE.open("a+")
+    handle = LOCK_FILE.open("a+b")
     LOCK_FILE.chmod(0o600)
     # Scheduled indexing and the daily backup may occasionally overlap. Queue
     # maintenance jobs instead of failing a once-per-day backup immediately.
-    fcntl.flock(handle, fcntl.LOCK_EX)
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX)
     return handle
 
 

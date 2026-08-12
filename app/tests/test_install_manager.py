@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -38,12 +39,26 @@ class InstallManagerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             command = home / "install" / "bin" / "khub"
-            self.assertTrue(manager.configure_codex(home, command, True))
+            arguments = [str(home / "app" / "server.py"), "mcp"]
+            environment = {"KHUB_DATA_DIR": str(home / "data")}
+            self.assertTrue(
+                manager.configure_codex(
+                    home, command, arguments, environment, True
+                )
+            )
             content = config.read_text(encoding="utf-8")
             self.assertIn('[mcp_servers.other]', content)
             self.assertEqual(content.count('[mcp_servers.local-knowledge]'), 1)
             self.assertIn(str(command), content)
-            self.assertTrue(manager.configure_codex(home, command, False))
+            parsed = tomllib.loads(content)
+            local = parsed["mcp_servers"]["local-knowledge"]
+            self.assertEqual(local["args"], arguments)
+            self.assertEqual(local["env"], environment)
+            self.assertTrue(
+                manager.configure_codex(
+                    home, command, arguments, environment, False
+                )
+            )
             content = config.read_text(encoding="utf-8")
             self.assertIn('[mcp_servers.other]', content)
             self.assertNotIn('mcp_servers.local-knowledge', content)
@@ -56,11 +71,19 @@ class InstallManagerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             command = Path(value) / "bin" / "khub"
-            manager.configure_json_mcp(path, command, True)
+            arguments = [str(Path(value) / "server.py"), "mcp"]
+            environment = {"KHUB_DATA_DIR": str(Path(value) / "data")}
+            manager.configure_json_mcp(
+                path, command, arguments, environment, True
+            )
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertIn("other", data["mcpServers"])
             self.assertEqual(data["mcpServers"]["local-knowledge"]["command"], str(command))
-            manager.configure_json_mcp(path, command, False)
+            self.assertEqual(data["mcpServers"]["local-knowledge"]["args"], arguments)
+            self.assertEqual(data["mcpServers"]["local-knowledge"]["env"], environment)
+            manager.configure_json_mcp(
+                path, command, arguments, environment, False
+            )
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertIn("other", data["mcpServers"])
             self.assertNotIn("local-knowledge", data["mcpServers"])
@@ -70,23 +93,80 @@ class InstallManagerTests(unittest.TestCase):
             root = Path(value)
             home = root / "home"
             install = root / "install"
-            (install / "app").mkdir(parents=True)
+            (install / "app" / "src").mkdir(parents=True)
+            (install / "app" / "src" / "knowledge_hub.py").touch()
             (install / "venv" / "bin").mkdir(parents=True)
             (install / "venv" / "bin" / "python3").touch()
             with (
                 mock.patch.object(manager.Path, "home", return_value=home),
-                mock.patch.dict(os.environ, {"KHUB_SKIP_LAUNCHCTL": "1"}),
+                mock.patch.dict(
+                    os.environ,
+                    {"KHUB_SKIP_LAUNCHCTL": "1", "KHUB_PLATFORM": "macos"},
+                ),
             ):
                 result = manager.initialize(install, MODULE_PATH.parents[1], False)
             onyx = install / "data" / "config" / "onyx.env"
             searx = install / "data" / "config" / "searxng" / "settings.yml"
             self.assertTrue(onyx.is_file())
             self.assertTrue(searx.is_file())
-            self.assertEqual(onyx.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(onyx.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("{{", onyx.read_text(encoding="utf-8"))
             self.assertNotIn("{{", searx.read_text(encoding="utf-8"))
-            self.assertTrue((install / "bin" / "khub").stat().st_mode & 0o100)
+            if os.name != "nt":
+                self.assertTrue((install / "bin" / "khub").stat().st_mode & 0o100)
             self.assertIn("clients", result)
+
+    def test_windows_initialize_writes_native_wrappers_and_mcp_launch(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / "home"
+            install = root / "install"
+            (install / "app" / "src").mkdir(parents=True)
+            (install / "app" / "src" / "knowledge_hub.py").touch()
+            (install / "venv" / "Scripts").mkdir(parents=True)
+            (install / "venv" / "Scripts" / "python.exe").touch()
+            with (
+                mock.patch.object(manager.Path, "home", return_value=home),
+                mock.patch.dict(
+                    os.environ,
+                    {"KHUB_SKIP_SCHEDULER": "1", "KHUB_PLATFORM": "windows"},
+                ),
+            ):
+                result = manager.initialize(install, MODULE_PATH.parents[1], False)
+                checks = manager.doctor(install)
+            self.assertEqual(result["platform"], "windows")
+            self.assertTrue((install / "bin" / "khub.cmd").is_file())
+            self.assertTrue(checks["passed"])
+            codex = tomllib.loads(
+                (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+            )["mcp_servers"]["local-knowledge"]
+            self.assertEqual(
+                codex["command"],
+                str(install.resolve() / "venv" / "Scripts" / "python.exe"),
+            )
+            self.assertEqual(codex["args"][-1], "mcp")
+            self.assertEqual(
+                codex["env"]["KHUB_DATA_DIR"], str(install.resolve() / "data")
+            )
+            wrapper = (install / "bin" / "khub.cmd").read_text(encoding="utf-8")
+            self.assertIn("%*", wrapper)
+            self.assertIn("KHUB_DATA_DIR", wrapper)
+
+    def test_windows_scheduled_tasks_use_per_user_limited_jobs(self):
+        with tempfile.TemporaryDirectory() as value:
+            install = Path(value)
+            with mock.patch.object(manager, "schtasks") as scheduler:
+                tasks = manager.install_scheduled_tasks(install, True)
+            self.assertEqual(set(tasks), set(manager.WINDOWS_TASKS.values()))
+            create_calls = [
+                call.args[0] for call in scheduler.call_args_list if call.args[0][0] == "/Create"
+            ]
+            self.assertEqual(len(create_calls), 3)
+            self.assertTrue(all("LIMITED" in arguments for arguments in create_calls))
+            self.assertTrue(
+                any("knowledge-hub-services.cmd" in " ".join(arguments) for arguments in create_calls)
+            )
 
 
 if __name__ == "__main__":

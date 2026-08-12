@@ -1,0 +1,54 @@
+name: Cross-platform CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s app/tests -v
+
+  install-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: macOS clean install, doctor, and purge uninstall
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export KHUB_SKIP_LAUNCHCTL=1
+          ./install.sh --without-services --install-dir "$RUNNER_TEMP/LocalKnowledgeHub"
+          "$RUNNER_TEMP/LocalKnowledgeHub/bin/knowledge-hub-doctor"
+          "$RUNNER_TEMP/LocalKnowledgeHub/uninstall.sh" --purge-data
+      - name: Windows clean install, doctor, and purge uninstall
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "LocalKnowledgeHub"
+          .\install.ps1 -WithoutServices -InstallDir $installRoot
+          & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
+          schtasks.exe /Query /TN LocalKnowledgeHub-Index
+          schtasks.exe /Query /TN LocalKnowledgeHub-Backup
+          & (Join-Path $installRoot "uninstall.ps1") -InstallDir $installRoot -PurgeData

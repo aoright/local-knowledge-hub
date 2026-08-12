@@ -1,10 +1,20 @@
-# Local Knowledge Hub for macOS
+# Local Knowledge Hub
 
 Local Knowledge Hub gives Codex, Antigravity, and Antigravity IDE one project-isolated local knowledge layer. It indexes project files locally, keeps controlled long-term memory, and optionally provides Onyx and private SearXNG web search.
 
 It does **not** synchronize or modify native chat databases.
 
 ## Requirements
+
+### Windows
+
+- 64-bit Windows 10 or Windows 11
+- Windows PowerShell 5.1 or PowerShell 7
+- 64-bit Python 3.11 or newer
+- For Onyx and web search: Docker Desktop with Linux containers
+- At least 10GB RAM is recommended when running Onyx
+
+### macOS
 
 - macOS 13 or newer
 - Python 3.11 or newer
@@ -13,33 +23,56 @@ It does **not** synchronize or modify native chat databases.
 
 ## Install
 
-Clone the repository and install:
+Clone the repository or download the platform archive from
+[GitHub Releases](https://github.com/aoright/local-knowledge-hub/releases).
+
+### Windows one-click install
+
+Extract `local-knowledge-hub-windows-1.1.0.zip`, open PowerShell in the extracted folder, and run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The installer does not require administrator privileges. The default location is:
+
+```text
+%LOCALAPPDATA%\LocalKnowledgeHub
+```
+
+Core-only installation without Onyx or SearXNG:
+
+```powershell
+.\install.ps1 -WithoutServices
+```
+
+### macOS install
 
 ```bash
-git clone https://github.com/aoright/local-knowledge-hub.git
-cd local-knowledge-hub
 ./install.sh
 ```
 
-Alternatively, download the latest `.tar.gz` and `.sha256` files from
-[GitHub Releases](https://github.com/aoright/local-knowledge-hub/releases),
-then verify the archive before extracting it:
-
-```bash
-shasum -a 256 -c local-knowledge-hub-macos-1.0.0.tar.gz.sha256
-```
-
-Core-only installation without Docker services:
+Core-only installation without Onyx or SearXNG:
 
 ```bash
 ./install.sh --without-services
 ```
 
-The default installation directory is `~/.local/share/local-knowledge-hub`.
+The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
 
 ## Commands
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\khub.cmd" status
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-doctor.cmd"
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\khub.cmd" web-search "latest MCP specification"
+```
+
+macOS:
 
 ```bash
 ~/.local/share/local-knowledge-hub/bin/khub status
@@ -47,29 +80,35 @@ After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks a
 ~/.local/share/local-knowledge-hub/bin/khub web-search 'latest MCP specification'
 ```
 
-Onyx is available at <http://127.0.0.1:3000>. On first use, create the first account using the locally generated credentials in:
+Onyx is available at <http://127.0.0.1:3000>. On first use, create the first account using the generated credentials under `data/config/admin.env` in the installation directory. Do not share this file.
 
-```text
-~/.local/share/local-knowledge-hub/data/config/admin.env
-```
+## Automatic maintenance
 
-This file is mode `0600`; do not share it.
+- Windows uses three per-user Task Scheduler jobs for service health, 30-minute incremental indexing, and daily backups.
+- macOS uses per-user LaunchAgents for the same jobs.
+- Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
 
 ## Upgrade
 
-Extract a newer release and run `./install.sh` again. Application files and the virtual environment are updated; the `data` directory is retained.
+Extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained.
 
 ## Uninstall
 
+Windows:
+
+```powershell
+.\uninstall.ps1
+.\uninstall.ps1 -PurgeData
+```
+
+macOS:
+
 ```bash
 ./uninstall.sh
-```
-
-This removes the application and client integration but keeps the knowledge database and backups. To remove everything:
-
-```bash
 ./uninstall.sh --purge-data
 ```
+
+The normal uninstall keeps the knowledge database and backups. The purge option removes local data and Docker volumes as well.
 
 ## Privacy boundary
 
@@ -78,7 +117,7 @@ This removes the application and client integration but keeps the knowledge data
 - Web content is marked untrusted and is never automatically promoted to durable memory.
 - The distribution contains no publisher project data or credentials.
 
-## Licensing note
+## License
 
 Local Knowledge Hub integration code is source-available under the
 [PolyForm Noncommercial License 1.0.0](LICENSE). Personal, research,

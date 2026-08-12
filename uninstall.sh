@@ -31,16 +31,20 @@ esac
 
 PYTHON="$INSTALL_ROOT/venv/bin/python3"
 MANAGER="$INSTALL_ROOT/app/src/install_manager.py"
+SERVICES="$INSTALL_ROOT/app/src/start_services.py"
+export KHUB_DATA_DIR="$INSTALL_ROOT/data"
+if [ -x "$PYTHON" ] && [ -f "$SERVICES" ]; then
+  if [ "$PURGE_DATA" -eq 1 ]; then
+    "$PYTHON" "$SERVICES" --stop --purge >/dev/null 2>&1 || true
+  else
+    "$PYTHON" "$SERVICES" --stop >/dev/null 2>&1 || true
+  fi
+fi
 if [ -x "$PYTHON" ] && [ -f "$MANAGER" ]; then
   "$PYTHON" "$MANAGER" unconfigure --install-root "$INSTALL_ROOT"
 fi
 
-if command -v docker >/dev/null 2>&1; then
-  docker compose -p knowledge-search down >/dev/null 2>&1 || true
-  docker compose -p knowledge-hub down >/dev/null 2>&1 || true
-fi
-
-for target in app .app.previous venv bin uninstall.sh README.md; do
+for target in app .app.previous venv bin uninstall.sh README.md LICENSE THIRD_PARTY_NOTICES.md; do
   if [ -e "$INSTALL_ROOT/$target" ]; then
     /bin/rm -rf "$INSTALL_ROOT/$target"
   fi

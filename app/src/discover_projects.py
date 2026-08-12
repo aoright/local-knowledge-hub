@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -41,11 +42,25 @@ def unique_collection_slug(db, base: str, existing_id: str | None = None) -> str
     return candidate
 
 
-def file_uri_to_path(uri: str) -> Path | None:
+def file_uri_path_text(uri: str, windows: bool | None = None) -> str | None:
     parsed = urllib.parse.urlparse(uri)
     if parsed.scheme != "file":
         return None
-    path = Path(urllib.parse.unquote(parsed.path)).resolve()
+    windows = os.name == "nt" if windows is None else windows
+    value = urllib.parse.unquote(parsed.path)
+    if windows:
+        if parsed.netloc:
+            value = f"//{parsed.netloc}{value}"
+        elif re.match(r"^/[A-Za-z]:/", value):
+            value = value[1:]
+    return value
+
+
+def file_uri_to_path(uri: str) -> Path | None:
+    value = file_uri_path_text(uri)
+    if value is None:
+        return None
+    path = Path(value).resolve()
     return path if path.is_dir() else None
 
 

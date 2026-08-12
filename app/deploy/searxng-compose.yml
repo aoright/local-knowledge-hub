@@ -6,7 +6,9 @@ services:
     ports:
       - "127.0.0.1:8888:8080"
     volumes:
-      - ${KHUB_SEARXNG_CONFIG_DIR:-./searxng}:/etc/searxng:rw
+      - type: bind
+        source: ${KHUB_SEARXNG_CONFIG_DIR:-./searxng}
+        target: /etc/searxng
       - searxng-cache:/var/cache/searxng
     environment:
       SEARXNG_BASE_URL: http://127.0.0.1:8888/
