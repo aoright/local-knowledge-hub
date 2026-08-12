@@ -49,9 +49,9 @@ class InstallManagerTests(unittest.TestCase):
             content = config.read_text(encoding="utf-8")
             self.assertIn('[mcp_servers.other]', content)
             self.assertEqual(content.count('[mcp_servers.local-knowledge]'), 1)
-            self.assertIn(str(command), content)
             parsed = tomllib.loads(content)
             local = parsed["mcp_servers"]["local-knowledge"]
+            self.assertEqual(local["command"], str(command))
             self.assertEqual(local["args"], arguments)
             self.assertEqual(local["env"], environment)
             self.assertTrue(
