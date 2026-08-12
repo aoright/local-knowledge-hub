@@ -23,6 +23,8 @@ def load(name):
 
 start = load("start_services")
 catalog = load("export_mcp_catalog")
+discover = load("discover_projects")
+maintenance = load("maintenance")
 
 
 class OperationsTests(unittest.TestCase):
@@ -53,6 +55,7 @@ class OperationsTests(unittest.TestCase):
                 mock.patch.object(start, "COLIMA", colima),
                 mock.patch.object(start, "DOCKER", docker),
                 mock.patch.object(start, "healthy", side_effect=[False, False]),
+                mock.patch.object(start.platform, "system", return_value="Darwin"),
                 mock.patch.object(start, "docker_running", side_effect=[False, True]),
                 mock.patch.object(start, "colima_running", return_value=False),
                 mock.patch.object(start, "wait_for_services", return_value={"onyx": True, "searxng": True}),
@@ -74,6 +77,70 @@ class OperationsTests(unittest.TestCase):
                 (target / "instructions.md").read_text(encoding="utf-8"),
                 catalog.kh.MCP_INSTRUCTIONS,
             )
+
+    def test_windows_starts_docker_desktop_before_compose(self):
+        with tempfile.TemporaryDirectory() as value:
+            docker = Path(value) / "docker.exe"
+            desktop = Path(value) / "Docker Desktop.exe"
+            docker.touch()
+            desktop.touch()
+            with (
+                mock.patch.object(start, "DOCKER", docker),
+                mock.patch.object(start.platform, "system", return_value="Windows"),
+                mock.patch.object(start, "healthy", side_effect=[False, False]),
+                mock.patch.object(
+                    start, "docker_running", side_effect=[False, False, True]
+                ),
+                mock.patch.object(start, "docker_desktop", return_value=desktop),
+                mock.patch.object(start, "wait_for_docker", return_value=True),
+                mock.patch.object(
+                    start,
+                    "wait_for_services",
+                    return_value={"onyx": True, "searxng": True},
+                ),
+                mock.patch.object(start.subprocess, "Popen") as popen,
+                mock.patch.object(start, "run") as runner,
+            ):
+                result = start.ensure_services()
+            self.assertEqual(result["action"], "started")
+            popen.assert_called_once()
+            self.assertEqual(runner.call_count, 2)
+
+    def test_stop_services_can_purge_volumes(self):
+        with tempfile.TemporaryDirectory() as value:
+            docker = Path(value) / "docker"
+            docker.touch()
+            with (
+                mock.patch.object(start, "DOCKER", docker),
+                mock.patch.object(start, "docker_running", return_value=True),
+                mock.patch.object(start, "run") as runner,
+            ):
+                result = start.stop_services(True)
+            self.assertEqual(result, {"action": "stopped", "purged": True})
+            self.assertEqual(runner.call_count, 2)
+            self.assertTrue(
+                all("--volumes" in call.args[0] for call in runner.call_args_list)
+            )
+
+    def test_windows_file_uri_removes_drive_prefix_slash(self):
+        self.assertEqual(
+            discover.file_uri_path_text("file:///C:/Users/example/project", windows=True),
+            "C:/Users/example/project",
+        )
+        self.assertEqual(
+            discover.file_uri_path_text(
+                "file://server/share/team/project", windows=True
+            ),
+            "//server/share/team/project",
+        )
+
+    def test_maintenance_lock_is_cross_platform(self):
+        with tempfile.TemporaryDirectory() as value:
+            lock_file = Path(value) / "maintenance.lock"
+            with mock.patch.object(maintenance, "LOCK_FILE", lock_file):
+                handle = maintenance.lock()
+                self.assertTrue(lock_file.is_file())
+                handle.close()
 
 
 if __name__ == "__main__":

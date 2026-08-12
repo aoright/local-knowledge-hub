@@ -1,0 +1,80 @@
+name: Cross-platform CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s app/tests -v
+
+  install-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: macOS clean install, doctor, and purge uninstall
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export KHUB_SKIP_LAUNCHCTL=1
+          ./install.sh --without-services --install-dir "$RUNNER_TEMP/LocalKnowledgeHub"
+          "$RUNNER_TEMP/LocalKnowledgeHub/bin/knowledge-hub-doctor"
+          "$RUNNER_TEMP/LocalKnowledgeHub/uninstall.sh" --purge-data
+      - name: Windows clean install, doctor, and purge uninstall
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "LocalKnowledgeHub"
+          .\install.ps1 -WithoutServices -InstallDir $installRoot
+          & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
+          schtasks.exe /Query /TN LocalKnowledgeHub-Index
+          schtasks.exe /Query /TN LocalKnowledgeHub-Backup
+          $mcpInput = @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"windows-ci","version":"1"}}}',
+            '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+          )
+          $env:KHUB_DATA_DIR = Join-Path $installRoot "data"
+          $venvPython = Join-Path $installRoot "venv\Scripts\python.exe"
+          $mcpServer = Join-Path $installRoot "app\src\knowledge_hub.py"
+          $mcpOutput = $mcpInput | & $venvPython $mcpServer mcp
+          if (($mcpOutput -join "`n") -notmatch 'knowledge_context') {
+            throw "MCP tools/list did not return knowledge_context. Output: $($mcpOutput -join ' | ')"
+          }
+          $before = (Get-ScheduledTaskInfo -TaskName "LocalKnowledgeHub-Index").LastRunTime
+          Start-ScheduledTask -TaskName "LocalKnowledgeHub-Index"
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Seconds 2
+            $task = Get-ScheduledTask -TaskName "LocalKnowledgeHub-Index"
+            $info = Get-ScheduledTaskInfo -TaskName "LocalKnowledgeHub-Index"
+          } while (($task.State -eq "Running" -or $info.LastRunTime -le $before) -and (Get-Date) -lt $deadline)
+          if ($task.State -eq "Running" -or $info.LastRunTime -le $before -or $info.LastTaskResult -ne 0) {
+            throw "Scheduled indexing task did not complete successfully: state=$($task.State) result=$($info.LastTaskResult)"
+          }
+          & (Join-Path $installRoot "uninstall.ps1") -InstallDir $installRoot -PurgeData
+          if (Get-ScheduledTask -TaskName "LocalKnowledgeHub-Index" -ErrorAction SilentlyContinue) {
+            throw "Scheduled task remained after uninstall"
+          }

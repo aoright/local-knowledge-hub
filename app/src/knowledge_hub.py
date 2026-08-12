@@ -683,9 +683,16 @@ def resolve_project_reference(
 
     path_hint = (workspace_path or "").strip()
     if path_hint.startswith("file://"):
-        path_hint = urllib.parse.unquote(urllib.parse.urlparse(path_hint).path)
-    if path_hint and (path_hint.startswith("/") or path_hint.startswith("~")):
-        candidate_path = Path(path_hint).expanduser().resolve()
+        parsed = urllib.parse.urlparse(path_hint)
+        path_hint = urllib.parse.unquote(parsed.path)
+        if os.name == "nt":
+            if parsed.netloc:
+                path_hint = f"//{parsed.netloc}{path_hint}"
+            elif re.match(r"^/[A-Za-z]:/", path_hint):
+                path_hint = path_hint[1:]
+    hinted_path = Path(path_hint).expanduser() if path_hint else None
+    if hinted_path is not None and (hinted_path.is_absolute() or path_hint.startswith("~")):
+        candidate_path = hinted_path.resolve()
         path_rows = sorted(
             db.execute(
                 "SELECT pp.path,p.slug FROM project_paths pp JOIN projects p ON p.id=pp.project_id "
@@ -2174,9 +2181,17 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
 
 
 def mcp_server(db_path: Path) -> None:
+    # MCP stdio is UTF-8 JSON on every supported platform.  Windows can inherit
+    # a legacy console code page even when stdout is redirected by a client.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     db = connect(db_path)
     initialize(db)
     for line in sys.stdin:
+        if not line.strip():
+            continue
         try:
             request = json.loads(line)
             method = request.get("method")

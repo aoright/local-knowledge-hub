@@ -67,6 +67,8 @@ fi
 mv "$NEW_APP" "$INSTALL_ROOT/app"
 /bin/cp "$PACKAGE_ROOT/uninstall.sh" "$INSTALL_ROOT/uninstall.sh"
 /bin/cp "$PACKAGE_ROOT/README.md" "$INSTALL_ROOT/README.md"
+/bin/cp "$PACKAGE_ROOT/LICENSE" "$INSTALL_ROOT/LICENSE"
+/bin/cp "$PACKAGE_ROOT/THIRD_PARTY_NOTICES.md" "$INSTALL_ROOT/THIRD_PARTY_NOTICES.md"
 chmod 700 "$INSTALL_ROOT/uninstall.sh"
 
 if [ ! -x "$INSTALL_ROOT/venv/bin/python3" ]; then

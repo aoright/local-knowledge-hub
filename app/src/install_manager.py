@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install-time configuration for the portable macOS distribution."""
+"""Install-time configuration for the portable macOS and Windows distributions."""
 
 from __future__ import annotations
 
@@ -33,6 +33,39 @@ LABELS = {
     "index": "com.local-knowledge-hub.index",
     "backup": "com.local-knowledge-hub.backup",
 }
+WINDOWS_TASKS = {
+    "services": "LocalKnowledgeHub-Services",
+    "index": "LocalKnowledgeHub-Index",
+    "backup": "LocalKnowledgeHub-Backup",
+}
+
+
+def current_platform() -> str:
+    override = os.environ.get("KHUB_PLATFORM", "").strip().lower()
+    if override in {"macos", "windows"}:
+        return override
+    if os.name == "nt" or sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "other"
+
+
+def runtime_python(install_root: Path, platform_name: str | None = None) -> Path:
+    platform_name = platform_name or current_platform()
+    if platform_name == "windows":
+        return install_root / "venv" / "Scripts" / "python.exe"
+    return install_root / "venv" / "bin" / "python3"
+
+
+def gateway_path(install_root: Path, platform_name: str | None = None) -> Path:
+    platform_name = platform_name or current_platform()
+    suffix = ".cmd" if platform_name == "windows" else ""
+    return install_root / "bin" / f"khub{suffix}"
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
@@ -92,18 +125,30 @@ def strip_codex_sections(content: str) -> str:
     return "".join(result).rstrip() + ("\n" if result else "")
 
 
-def configure_codex(home: Path, command: Path, enabled: bool) -> bool:
+def configure_codex(
+    home: Path,
+    command: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+    enabled: bool,
+) -> bool:
     path = home / ".codex" / "config.toml"
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     updated = strip_codex_sections(existing)
     if enabled:
-        escaped = str(command).replace("\\", "\\\\").replace('"', '\\"')
+        args = ", ".join(toml_string(value) for value in arguments)
         block = (
             "[mcp_servers.local-knowledge]\n"
-            f'command = "{escaped}"\n'
-            'args = ["mcp"]\n'
+            f"command = {toml_string(str(command))}\n"
+            f"args = [{args}]\n"
             "startup_timeout_sec = 30\n"
             "enabled = true\n\n"
+            "[mcp_servers.local-knowledge.env]\n"
+            + "".join(
+                f"{key} = {toml_string(value)}\n"
+                for key, value in sorted(environment.items())
+            )
+            + "\n"
             "[mcp_servers.local-knowledge.tools.web_search]\n"
             'approval_mode = "approve"\n'
         )
@@ -114,7 +159,13 @@ def configure_codex(home: Path, command: Path, enabled: bool) -> bool:
     return False
 
 
-def configure_json_mcp(path: Path, command: Path, enabled: bool) -> bool:
+def configure_json_mcp(
+    path: Path,
+    command: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+    enabled: bool,
+) -> bool:
     if not enabled and not path.is_file():
         return False
     if path.is_file():
@@ -129,7 +180,11 @@ def configure_json_mcp(path: Path, command: Path, enabled: bool) -> bool:
         raise ValueError(f"mcpServers must be an object: {path}")
     changed = False
     if enabled:
-        desired = {"command": str(command), "args": ["mcp"]}
+        desired = {
+            "command": str(command),
+            "args": arguments,
+            "env": environment,
+        }
         if servers.get("local-knowledge") != desired:
             servers["local-knowledge"] = desired
             changed = True
@@ -144,14 +199,24 @@ def configure_json_mcp(path: Path, command: Path, enabled: bool) -> bool:
 
 
 def configure_clients(home: Path, install_root: Path, enabled: bool) -> dict[str, Any]:
-    command = install_root / "bin" / "khub"
+    command = runtime_python(install_root)
+    arguments = [str(install_root / "app" / "src" / "knowledge_hub.py"), "mcp"]
+    environment = {"KHUB_DATA_DIR": str(install_root / "data")}
     return {
-        "codex": configure_codex(home, command, enabled),
+        "codex": configure_codex(home, command, arguments, environment, enabled),
         "antigravity": configure_json_mcp(
-            home / ".gemini" / "config" / "mcp_config.json", command, enabled
+            home / ".gemini" / "config" / "mcp_config.json",
+            command,
+            arguments,
+            environment,
+            enabled,
         ),
         "antigravity_ide": configure_json_mcp(
-            home / ".gemini" / "antigravity-ide" / "mcp_config.json", command, enabled
+            home / ".gemini" / "antigravity-ide" / "mcp_config.json",
+            command,
+            arguments,
+            environment,
+            enabled,
         ),
         "agents": configure_agents(home, enabled),
     }
@@ -165,10 +230,62 @@ def shell_wrapper(python: Path, script: Path, data_root: Path, arguments: str = 
     )
 
 
-def write_wrappers(install_root: Path) -> None:
+def batch_value(value: str) -> str:
+    return value.replace("%", "%%")
+
+
+def batch_wrapper(
+    python: Path,
+    script: Path,
+    data_root: Path,
+    fixed_arguments: list[str] | None = None,
+    forward_arguments: bool = False,
+) -> str:
+    values = [str(python), str(script), *(fixed_arguments or [])]
+    command = " ".join(f'"{batch_value(value)}"' for value in values)
+    if forward_arguments:
+        command += " %*"
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        f'set "KHUB_DATA_DIR={batch_value(str(data_root))}"\r\n'
+        f"{command}\r\n"
+        "exit /b %errorlevel%\r\n"
+    )
+
+
+def write_wrappers(install_root: Path, platform_name: str | None = None) -> None:
+    platform_name = platform_name or current_platform()
     app = install_root / "app"
     data = install_root / "data"
-    python = install_root / "venv" / "bin" / "python3"
+    python = runtime_python(install_root, platform_name)
+    if platform_name == "windows":
+        wrappers = {
+            "khub.cmd": batch_wrapper(
+                python, app / "src" / "knowledge_hub.py", data, forward_arguments=True
+            ),
+            "knowledge-hub-services.cmd": batch_wrapper(
+                python, app / "src" / "start_services.py", data, ["--once"]
+            ),
+            "knowledge-hub-index.cmd": batch_wrapper(
+                python, app / "src" / "maintenance.py", data, ["ingest-all"]
+            ),
+            "knowledge-hub-backup.cmd": batch_wrapper(
+                python,
+                app / "src" / "maintenance.py",
+                data,
+                ["backup", "--retain", "14"],
+            ),
+            "knowledge-hub-doctor.cmd": batch_wrapper(
+                python,
+                app / "src" / "install_manager.py",
+                data,
+                ["doctor", "--install-root", str(install_root)],
+            ),
+        }
+        for name, content in wrappers.items():
+            atomic_write(install_root / "bin" / name, content, 0o700)
+        return
     wrappers = {
         "khub": shell_wrapper(python, app / "src" / "knowledge_hub.py", data),
         "knowledge-hub-services": shell_wrapper(
@@ -266,6 +383,61 @@ def uninstall_launch_agents(home: Path) -> list[str]:
     return removed
 
 
+def schtasks(arguments: list[str], check: bool = True) -> subprocess.CompletedProcess[str] | None:
+    if os.environ.get("KHUB_SKIP_SCHEDULER") == "1":
+        return None
+    return subprocess.run(
+        ["schtasks.exe", *arguments],
+        check=check,
+        text=True,
+        capture_output=True,
+    )
+
+
+def scheduled_command(wrapper: Path) -> str:
+    return f'cmd.exe /d /c ""{wrapper}""'
+
+
+def install_scheduled_tasks(install_root: Path, services: bool) -> list[str]:
+    definitions = {
+        "index": ["/SC", "MINUTE", "/MO", "30"],
+        "backup": ["/SC", "DAILY", "/ST", "03:15"],
+    }
+    if services:
+        definitions["services"] = ["/SC", "MINUTE", "/MO", "5"]
+    installed: list[str] = []
+    for suffix, schedule in definitions.items():
+        task_name = WINDOWS_TASKS[suffix]
+        wrapper = install_root / "bin" / f"knowledge-hub-{suffix}.cmd"
+        schtasks(["/Delete", "/TN", task_name, "/F"], check=False)
+        schtasks(
+            [
+                "/Create",
+                "/TN",
+                task_name,
+                *schedule,
+                "/TR",
+                scheduled_command(wrapper),
+                "/RL",
+                "LIMITED",
+                "/F",
+            ]
+        )
+        installed.append(task_name)
+    if not services:
+        schtasks(["/Delete", "/TN", WINDOWS_TASKS["services"], "/F"], check=False)
+    return installed
+
+
+def uninstall_scheduled_tasks() -> list[str]:
+    removed: list[str] = []
+    for task_name in WINDOWS_TASKS.values():
+        result = schtasks(["/Delete", "/TN", task_name, "/F"], check=False)
+        if result is None or result.returncode == 0:
+            removed.append(task_name)
+    return removed
+
+
 def initialize(install_root: Path, source_app: Path, services: bool) -> dict[str, Any]:
     install_root = install_root.expanduser().resolve()
     source_app = source_app.resolve()
@@ -305,15 +477,25 @@ def initialize(install_root: Path, source_app: Path, services: bool) -> dict[str
             f"ONYX_ADMIN_PASSWORD={secrets.token_urlsafe(24)}\n",
         )
 
-    write_wrappers(install_root)
+    platform_name = current_platform()
+    if platform_name not in {"macos", "windows"}:
+        raise RuntimeError(f"Unsupported platform: {platform_name}")
+    write_wrappers(install_root, platform_name)
     home = Path.home()
     clients = configure_clients(home, install_root, True)
-    agents = install_launch_agents(home, install_root, services)
+    agents: list[str] = []
+    tasks: list[str] = []
+    if platform_name == "windows":
+        tasks = install_scheduled_tasks(install_root, services)
+    else:
+        agents = install_launch_agents(home, install_root, services)
     return {
+        "platform": platform_name,
         "install_root": str(install_root),
         "data_root": str(data),
         "clients": clients,
         "launch_agents": agents,
+        "scheduled_tasks": tasks,
         "onyx_credentials": str(credentials),
     }
 
@@ -322,10 +504,11 @@ def doctor(install_root: Path) -> dict[str, Any]:
     install_root = install_root.expanduser().resolve()
     data = install_root / "data"
     db_path = data / "knowledge-hub.sqlite3"
+    platform_name = current_platform()
     checks: dict[str, Any] = {
         "app": (install_root / "app" / "src" / "knowledge_hub.py").is_file(),
-        "python": (install_root / "venv" / "bin" / "python3").is_file(),
-        "gateway": (install_root / "bin" / "khub").is_file(),
+        "python": runtime_python(install_root, platform_name).is_file(),
+        "gateway": gateway_path(install_root, platform_name).is_file(),
         "private_onyx_config": (data / "config" / "onyx.env").is_file(),
         "private_search_config": (data / "config" / "searxng" / "settings.yml").is_file(),
     }
@@ -362,9 +545,15 @@ def main() -> int:
     if args.command == "initialize":
         value = initialize(args.install_root, args.source_app, not args.without_services)
     elif args.command == "unconfigure":
+        platform_name = current_platform()
         value = {
             "clients": configure_clients(Path.home(), args.install_root.resolve(), False),
-            "launch_agents": uninstall_launch_agents(Path.home()),
+            "launch_agents": (
+                uninstall_launch_agents(Path.home()) if platform_name == "macos" else []
+            ),
+            "scheduled_tasks": (
+                uninstall_scheduled_tasks() if platform_name == "windows" else []
+            ),
         }
     else:
         value = doctor(args.install_root)

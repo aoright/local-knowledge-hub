@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -88,6 +89,39 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIn("knowledge_update", [tool["name"] for tool in tools])
         self.assertIn("knowledge_forget", [tool["name"] for tool in tools])
         self.assertIn("knowledge_move", [tool["name"] for tool in tools])
+
+    def test_mcp_stdio_is_utf8_and_ignores_blank_frames(self):
+        db_path = Path(self.tmp.name) / "mcp.sqlite3"
+        requests = "\n" + "\n".join(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {},
+                    }
+                ),
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                ),
+            )
+        ) + "\n"
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--db", str(db_path), "mcp"],
+            input=requests,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=True,
+        )
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([response["id"] for response in responses], [1, 2])
+        self.assertIn(
+            "knowledge_context",
+            [tool["name"] for tool in responses[1]["result"]["tools"]],
+        )
+        self.assertNotIn('"error"', result.stdout)
 
     def test_resolve_project_from_workspace_path(self):
         nested = self.root / "src" / "module"
