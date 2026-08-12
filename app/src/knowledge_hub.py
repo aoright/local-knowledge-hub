@@ -2181,9 +2181,17 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
 
 
 def mcp_server(db_path: Path) -> None:
+    # MCP stdio is UTF-8 JSON on every supported platform.  Windows can inherit
+    # a legacy console code page even when stdout is redirected by a client.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     db = connect(db_path)
     initialize(db)
     for line in sys.stdin:
+        if not line.strip():
+            continue
         try:
             request = json.loads(line)
             method = request.get("method")
