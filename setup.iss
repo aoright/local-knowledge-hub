@@ -42,19 +42,16 @@ Source: "uninstall.ps1"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignor
 Source: "README.md"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
-Source: "VERSION"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
+Source: "VERSION"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion; AfterInstall: RunInstaller
 
 [Code]
-procedure CurStepChanged(CurStep: TSetupStep);
+procedure RunInstaller;
 var
   PowerShellPath: String;
   InstallerPath: String;
   Parameters: String;
   ResultCode: Integer;
 begin
-  if CurStep <> ssPostInstall then
-    Exit;
-
   PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
   InstallerPath := ExpandConstant('{tmp}\LocalKnowledgeHubPackage\install.ps1');
   Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + InstallerPath + '"';
