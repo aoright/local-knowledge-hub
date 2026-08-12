@@ -28,13 +28,23 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Extract `local-knowledge-hub-windows-1.1.0.zip`, open PowerShell in the extracted folder, and run:
+Download `LocalKnowledgeHub-Setup-1.1.1.exe` and double-click it. The setup
+wizard lets you choose between the complete installation and the core-only
+installation. It installs for the current user and does not require administrator
+privileges.
+
+The executable is currently unsigned, so Windows SmartScreen may show an
+unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
+before running it.
+
+Portable alternative: extract `local-knowledge-hub-windows-1.1.1.zip` and
+double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer does not require administrator privileges. The default location is:
+The default location is:
 
 ```text
 %LOCALAPPDATA%\LocalKnowledgeHub

@@ -47,7 +47,23 @@ jobs:
         shell: powershell
         run: |
           $installRoot = Join-Path $env:RUNNER_TEMP "LocalKnowledgeHub"
-          .\install.ps1 -WithoutServices -InstallDir $installRoot
+          $installerOutput = Join-Path $env:RUNNER_TEMP "windows-installer"
+          New-Item -ItemType Directory -Force -Path $installerOutput | Out-Null
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "Inno Setup compiler was not found: $iscc"
+          }
+          $version = (Get-Content -LiteralPath .\VERSION -Raw).Trim()
+          & $iscc "/DMyAppVersion=$version" "/O$installerOutput" .\setup.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows installer compilation failed."
+          }
+          $setup = Join-Path $installerOutput "LocalKnowledgeHub-Setup-$version.exe"
+          $env:LOCAL_KNOWLEDGE_HOME = $installRoot
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=core
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows executable installer failed with exit code $LASTEXITCODE."
+          }
           & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
           schtasks.exe /Query /TN LocalKnowledgeHub-Index
           schtasks.exe /Query /TN LocalKnowledgeHub-Backup
@@ -78,3 +94,10 @@ jobs:
           if (Get-ScheduledTask -TaskName "LocalKnowledgeHub-Index" -ErrorAction SilentlyContinue) {
             throw "Scheduled task remained after uninstall"
           }
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: ${{ runner.temp }}/windows-installer/LocalKnowledgeHub-Setup-*.exe
+          if-no-files-found: error
