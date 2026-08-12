@@ -56,9 +56,12 @@ jobs:
             '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
           )
-          $mcpOutput = $mcpInput | & (Join-Path $installRoot "bin\khub.cmd") mcp
+          $env:KHUB_DATA_DIR = Join-Path $installRoot "data"
+          $venvPython = Join-Path $installRoot "venv\Scripts\python.exe"
+          $mcpServer = Join-Path $installRoot "app\src\knowledge_hub.py"
+          $mcpOutput = $mcpInput | & $venvPython $mcpServer mcp
           if (($mcpOutput -join "`n") -notmatch 'knowledge_context') {
-            throw "MCP tools/list did not return knowledge_context"
+            throw "MCP tools/list did not return knowledge_context. Output: $($mcpOutput -join ' | ')"
           }
           $before = (Get-ScheduledTaskInfo -TaskName "LocalKnowledgeHub-Index").LastRunTime
           Start-ScheduledTask -TaskName "LocalKnowledgeHub-Index"
