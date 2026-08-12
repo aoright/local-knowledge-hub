@@ -1,0 +1,15 @@
+services:
+  searxng:
+    image: docker.io/searxng/searxng@sha256:b1176f7972781aed478734769e3040d62bc56e53fba1558e08503e5a5c619e0b
+    container_name: knowledge-hub-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ${KHUB_SEARXNG_CONFIG_DIR:-./searxng}:/etc/searxng:rw
+      - searxng-cache:/var/cache/searxng
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8888/
+
+volumes:
+  searxng-cache:
