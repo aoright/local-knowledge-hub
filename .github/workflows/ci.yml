@@ -2,7 +2,7 @@ name: Cross-platform CI
 
 on:
   push:
-    branches: [main, "agent/**"]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -51,4 +51,27 @@ jobs:
           & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
           schtasks.exe /Query /TN LocalKnowledgeHub-Index
           schtasks.exe /Query /TN LocalKnowledgeHub-Backup
+          $mcpInput = @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"windows-ci","version":"1"}}}',
+            '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+          )
+          $mcpOutput = $mcpInput | & (Join-Path $installRoot "bin\khub.cmd") mcp
+          if (($mcpOutput -join "`n") -notmatch 'knowledge_context') {
+            throw "MCP tools/list did not return knowledge_context"
+          }
+          $before = (Get-ScheduledTaskInfo -TaskName "LocalKnowledgeHub-Index").LastRunTime
+          Start-ScheduledTask -TaskName "LocalKnowledgeHub-Index"
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Seconds 2
+            $task = Get-ScheduledTask -TaskName "LocalKnowledgeHub-Index"
+            $info = Get-ScheduledTaskInfo -TaskName "LocalKnowledgeHub-Index"
+          } while (($task.State -eq "Running" -or $info.LastRunTime -le $before) -and (Get-Date) -lt $deadline)
+          if ($task.State -eq "Running" -or $info.LastRunTime -le $before -or $info.LastTaskResult -ne 0) {
+            throw "Scheduled indexing task did not complete successfully: state=$($task.State) result=$($info.LastTaskResult)"
+          }
           & (Join-Path $installRoot "uninstall.ps1") -InstallDir $installRoot -PurgeData
+          if (Get-ScheduledTask -TaskName "LocalKnowledgeHub-Index" -ErrorAction SilentlyContinue) {
+            throw "Scheduled task remained after uninstall"
+          }
