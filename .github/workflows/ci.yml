@@ -60,9 +60,11 @@ jobs:
           }
           $setup = Join-Path $installerOutput "LocalKnowledgeHub-Setup-$version.exe"
           $env:LOCAL_KNOWLEDGE_HOME = $installRoot
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=core
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows executable installer failed with exit code $LASTEXITCODE."
+          $setupProcess = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/COMPONENTS=core"
+          ) -Wait -PassThru
+          if ($setupProcess.ExitCode -ne 0) {
+            throw "Windows executable installer failed with exit code $($setupProcess.ExitCode)."
           }
           & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
           schtasks.exe /Query /TN LocalKnowledgeHub-Index
