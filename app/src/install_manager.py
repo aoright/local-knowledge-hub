@@ -21,8 +21,8 @@ MANAGED_BEGIN = "<!-- local-knowledge-hub:begin -->"
 MANAGED_END = "<!-- local-knowledge-hub:end -->"
 INSTRUCTIONS = """# Shared local knowledge automation
 
-- Use the `local-knowledge` MCP automatically when a task depends on project code, documentation, prior decisions, troubleshooting history, or current external information. The user does not need to name the tool.
-- Before substantive project work, call `knowledge_context` with the current workspace absolute path or project name and a concise task-specific query. Keep `include_global=true` so the server combines the current project with a small, relevant global context. Ask which project only if resolution is ambiguous.
+- For every task that may read, explain, diagnose, edit, test, review, or build project files, make `knowledge_context` the first tool call before planning or inspecting files. Do this once per task even when the task looks simple or the user did not mention local knowledge.
+- Pass the current workspace absolute path and a concise task-specific query. Keep `include_global=true` so the server combines the current project with a small, relevant global context. Ask which project only if resolution is ambiguous. Do not call it for ordinary conversation unrelated to project work.
 - For current or external information, call `web_search` automatically and use `web_fetch` on the most relevant primary sources.
 - At task completion, call `knowledge_capture` with `scope=auto` only for an explicit user-authored durable decision, fact, constraint, or runbook. Statements explicitly applying to all projects or globally may enter a global scope; otherwise they remain in the current project. Never capture ordinary chat, guesses, transient debugging, secrets, web claims, or facts already represented by project files.
 - When the user corrects, revokes, promotes, or demotes a memory, use `knowledge_update`, `knowledge_forget`, or `knowledge_move` automatically and preserve the user's evidence.
@@ -98,14 +98,48 @@ def replace_managed_block(content: str, block: str | None) -> str:
     return f"{content}\n\n{managed}\n" if content else managed + "\n"
 
 
+def remove_legacy_instruction_section(content: str) -> str:
+    """Remove the exact pre-managed local-knowledge section, preserving peers."""
+    lines = content.splitlines(keepends=True)
+    output: list[str] = []
+    skipping_level: int | None = None
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s+Shared Local Knowledge Automation\s*$", line, re.I)
+        if heading:
+            skipping_level = len(heading.group(1))
+            continue
+        if skipping_level is not None:
+            next_heading = re.match(r"^(#{1,6})\s+", line)
+            if not next_heading or len(next_heading.group(1)) > skipping_level:
+                continue
+            skipping_level = None
+        output.append(line)
+    return "".join(output).rstrip() + ("\n" if output else "")
+
+
 def configure_agents(home: Path, enabled: bool) -> list[str]:
     changed: list[str] = []
-    for path in (home / ".codex" / "AGENTS.md", home / ".gemini" / "config" / "AGENTS.md"):
+    # Codex and Antigravity use different official global-rule locations.
+    for path in (home / ".codex" / "AGENTS.md", home / ".gemini" / "GEMINI.md"):
         existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-        updated = replace_managed_block(existing, INSTRUCTIONS if enabled else None)
+        migrated = remove_legacy_instruction_section(
+            replace_managed_block(existing, None)
+        )
+        updated = replace_managed_block(migrated, INSTRUCTIONS if enabled else None)
         if updated != existing:
             atomic_write(path, updated)
             changed.append(str(path))
+    # Remove only our obsolete managed block from the pre-1.2 location. Any
+    # unrelated user content in that file is preserved.
+    legacy = home / ".gemini" / "config" / "AGENTS.md"
+    if legacy.is_file():
+        existing = legacy.read_text(encoding="utf-8")
+        updated = remove_legacy_instruction_section(
+            replace_managed_block(existing, None)
+        )
+        if updated != existing:
+            atomic_write(legacy, updated)
+            changed.append(str(legacy))
     return changed
 
 
@@ -274,7 +308,7 @@ def write_wrappers(install_root: Path, platform_name: str | None = None) -> None
                 python,
                 app / "src" / "maintenance.py",
                 data,
-                ["backup", "--retain", "14"],
+                ["backup", "--mode", "critical", "--retain", "14"],
             ),
             "knowledge-hub-doctor.cmd": batch_wrapper(
                 python,
@@ -352,7 +386,7 @@ def install_launch_agents(home: Path, install_root: Path, services: bool) -> lis
         ),
         "backup": plist_payload(
             LABELS["backup"],
-            [python, str(app / "maintenance.py"), "backup", "--retain", "14"],
+            [python, str(app / "maintenance.py"), "backup", "--mode", "critical", "--retain", "14"],
             install_root, {"StartCalendarInterval": {"Hour": 3, "Minute": 15}},
         ),
     }
@@ -540,6 +574,7 @@ def main() -> int:
     unconfigure.add_argument("--install-root", type=Path, required=True)
     check = sub.add_parser("doctor")
     check.add_argument("--install-root", type=Path, required=True)
+    sub.add_parser("configure-rules")
     args = parser.parse_args()
 
     if args.command == "initialize":
@@ -555,8 +590,10 @@ def main() -> int:
                 uninstall_scheduled_tasks() if platform_name == "windows" else []
             ),
         }
-    else:
+    elif args.command == "doctor":
         value = doctor(args.install_root)
+    else:
+        value = {"changed": configure_agents(Path.home(), True)}
     print(json.dumps(value, ensure_ascii=False, indent=2))
     return 0 if value.get("passed", True) else 1
 

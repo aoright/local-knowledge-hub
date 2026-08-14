@@ -27,6 +27,46 @@ class InstallManagerTests(unittest.TestCase):
         self.assertIn("Keep this.", removed)
         self.assertNotIn(manager.MANAGED_BEGIN, removed)
 
+    def test_antigravity_rule_uses_official_global_gemini_file(self):
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            legacy = home / ".gemini" / "config" / "AGENTS.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                manager.replace_managed_block("# User legacy\n", manager.INSTRUCTIONS),
+                encoding="utf-8",
+            )
+            manager.configure_agents(home, True)
+            gemini = home / ".gemini" / "GEMINI.md"
+            self.assertIn(manager.MANAGED_BEGIN, gemini.read_text(encoding="utf-8"))
+            legacy_content = legacy.read_text(encoding="utf-8")
+            self.assertIn("# User legacy", legacy_content)
+            self.assertNotIn(manager.MANAGED_BEGIN, legacy_content)
+
+    def test_pre_managed_rule_is_migrated_without_duplication(self):
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            legacy = home / ".gemini" / "config" / "AGENTS.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                "# Global Rules\n\n## Keep Me\nValue\n\n"
+                "## Shared Local Knowledge Automation\n\n- Old rule\n",
+                encoding="utf-8",
+            )
+            codex = home / ".codex" / "AGENTS.md"
+            codex.parent.mkdir(parents=True)
+            codex.write_text(
+                "# Shared local knowledge automation\n\n- Old rule\n",
+                encoding="utf-8",
+            )
+            manager.configure_agents(home, True)
+            self.assertEqual(
+                codex.read_text(encoding="utf-8").count(manager.MANAGED_BEGIN), 1
+            )
+            legacy_content = legacy.read_text(encoding="utf-8")
+            self.assertIn("## Keep Me", legacy_content)
+            self.assertNotIn("Shared Local Knowledge", legacy_content)
+
     def test_codex_configuration_replaces_only_local_knowledge_sections(self):
         with tempfile.TemporaryDirectory() as value:
             home = Path(value)
@@ -152,6 +192,10 @@ class InstallManagerTests(unittest.TestCase):
             wrapper = (install / "bin" / "khub.cmd").read_text(encoding="utf-8")
             self.assertIn("%*", wrapper)
             self.assertIn("KHUB_DATA_DIR", wrapper)
+            backup_wrapper = (
+                install / "bin" / "knowledge-hub-backup.cmd"
+            ).read_text(encoding="utf-8")
+            self.assertIn('"--mode" "critical"', backup_wrapper)
 
     def test_windows_scheduled_tasks_use_per_user_limited_jobs(self):
         with tempfile.TemporaryDirectory() as value:

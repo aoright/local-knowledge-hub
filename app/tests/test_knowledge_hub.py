@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,14 @@ class KnowledgeHubTests(unittest.TestCase):
                 json.dumps(
                     {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
                 ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "knowledge_status", "arguments": {}},
+                    }
+                ),
             )
         ) + "\n"
         result = subprocess.run(
@@ -116,12 +125,19 @@ class KnowledgeHubTests(unittest.TestCase):
             check=True,
         )
         responses = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual([response["id"] for response in responses], [1, 2])
+        self.assertEqual([response["id"] for response in responses], [1, 2, 3])
         self.assertIn(
             "knowledge_context",
             [tool["name"] for tool in responses[1]["result"]["tools"]],
         )
         self.assertNotIn('"error"', result.stdout)
+        audit_db = sqlite3.connect(db_path)
+        audit_rows = audit_db.execute(
+            "SELECT action,details_json FROM audit_log ORDER BY id"
+        ).fetchall()
+        audit_db.close()
+        self.assertEqual([row[0] for row in audit_rows], ["mcp.initialize", "mcp.tool_call"])
+        self.assertEqual(json.loads(audit_rows[1][1])["tool"], "knowledge_status")
 
     def test_resolve_project_from_workspace_path(self):
         nested = self.root / "src" / "module"
