@@ -283,6 +283,7 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(verified["mode"], "critical")
             self.assertEqual(verified["memories"], 1)
             self.assertEqual(verified["documents"], 1)
+            self.assertFalse(any(backup_dir.glob("tmp*")))
 
 
 if __name__ == "__main__":

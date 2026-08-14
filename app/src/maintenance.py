@@ -134,7 +134,8 @@ def backup(retain: int = 14, mode: str = "full") -> dict:
             copied = {}
         target_db.close()
         source_db.close()
-        check = sqlite3.connect(snapshot).execute("PRAGMA integrity_check").fetchone()[0]
+        with sqlite3.connect(snapshot) as check_db:
+            check = check_db.execute("PRAGMA integrity_check").fetchone()[0]
         if check != "ok":
             raise RuntimeError(f"备份完整性检查失败：{check}")
         with snapshot.open("rb") as source, gzip.open(destination, "wb", compresslevel=6) as target:
