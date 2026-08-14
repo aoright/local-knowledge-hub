@@ -28,7 +28,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.1.1.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.2.0.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges.
@@ -37,7 +37,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.1.1.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.2.0.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -97,6 +97,10 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
 - Windows uses three per-user Task Scheduler jobs for service health, 30-minute incremental indexing, and daily backups.
 - macOS uses per-user LaunchAgents for the same jobs.
 - Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
+- Git projects—and collection folders containing multiple Git repositories—use content-sensitive working-tree fingerprints, so unchanged projects avoid repeated full file walks. A full verification scan still runs at least once every 24 hours.
+- Daily scheduled backups preserve project registration, collections, long-term memories, history, embeddings, and audit records while omitting rebuildable file indexes and web caches. Existing full backups are retained separately; `maintenance.py backup --mode full` remains available for manual snapshots.
+- MCP initialization and tool calls are recorded locally with client name, success state, and duration. Tool arguments and project contents are not written to the usage audit.
+- Codex automation rules are stored in `~/.codex/AGENTS.md`; Antigravity rules are stored in the official `~/.gemini/GEMINI.md` location. Older managed Antigravity rules are migrated without removing unrelated user instructions.
 
 ## Upgrade
 

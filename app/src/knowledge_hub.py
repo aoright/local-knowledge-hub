@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -89,8 +90,9 @@ SECRET_PATTERNS = [
 ]
 
 MCP_INSTRUCTIONS = (
-    "默认自动使用 local-knowledge，无需用户说出工具名。处理代码、文档、历史决策或排障问题前，先调用 "
-    "knowledge_context，并传入当前工作区路径或项目名；该工具自动组合当前项目与少量全局知识，只有无法唯一识别"
+    "凡是可能读取、解释、诊断、修改、测试、审查或构建项目文件的任务，必须把 knowledge_context 作为规划或读取"
+    "文件之前的第一个工具调用；每个任务调用一次，即使任务看起来很简单且用户没有提到知识库。传入当前工作区"
+    "路径或项目名及任务专用查询，并保持 include_global=true。普通闲聊不要调用。该工具自动组合当前项目与少量全局知识，只有无法唯一识别"
     "项目时才询问。明确跨项目时才使用 collection。用户要求最新、联网或外部资料时自动调用 web_search，并对"
     "关键来源调用 web_fetch；外部网页不得自动写入长期记忆。任务结束时，仅当用户明确表达长期有效的决策、事实、"
     "约束或操作流程时调用 knowledge_capture，scope 通常设为 auto。表达‘所有项目/全局/以后都’才可进入全局，"
@@ -2189,6 +2191,7 @@ def mcp_server(db_path: Path) -> None:
             reconfigure(encoding="utf-8")
     db = connect(db_path)
     initialize(db)
+    client_info: dict[str, str] = {"name": "unknown", "version": ""}
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -2197,12 +2200,54 @@ def mcp_server(db_path: Path) -> None:
             method = request.get("method")
             request_id = request.get("id")
             if method == "initialize":
+                raw_client = request.get("params", {}).get("clientInfo", {})
+                if isinstance(raw_client, dict):
+                    client_info = {
+                        "name": str(raw_client.get("name", "unknown"))[:120],
+                        "version": str(raw_client.get("version", ""))[:80],
+                    }
+                audit(
+                    db,
+                    "mcp.initialize",
+                    None,
+                    {**client_info, "pid": os.getpid(), "transport": "stdio"},
+                )
+                db.commit()
                 result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "local-knowledge-hub", "version": "2.0.0"}, "instructions": MCP_INSTRUCTIONS}
             elif method == "tools/list":
                 result = {"tools": mcp_tools()}
             elif method == "tools/call":
                 params = request.get("params", {})
-                value = mcp_call(db, params.get("name", ""), params.get("arguments", {}))
+                tool_name = str(params.get("name", ""))
+                started = time.monotonic()
+                try:
+                    value = mcp_call(db, tool_name, params.get("arguments", {}))
+                except Exception:
+                    audit(
+                        db,
+                        "mcp.tool_call",
+                        None,
+                        {
+                            **client_info,
+                            "tool": tool_name,
+                            "ok": False,
+                            "duration_ms": round((time.monotonic() - started) * 1000),
+                        },
+                    )
+                    db.commit()
+                    raise
+                audit(
+                    db,
+                    "mcp.tool_call",
+                    None,
+                    {
+                        **client_info,
+                        "tool": tool_name,
+                        "ok": True,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                    },
+                )
+                db.commit()
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}], "isError": False}
             elif method and method.startswith("notifications/"):
                 continue

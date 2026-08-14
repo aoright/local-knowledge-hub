@@ -41,7 +41,18 @@ if platform.system() == "Darwin":
 
 
 def run(command: list[str], timeout: int = 900, env: dict[str, str] | None = None) -> None:
-    subprocess.run(command, check=True, timeout=timeout, env=env)
+    result = subprocess.run(
+        command,
+        check=False,
+        timeout=timeout,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        message = detail[-1] if detail else f"exit code {result.returncode}"
+        raise RuntimeError(f"{Path(command[0]).name} failed: {message}")
 
 
 def healthy(url: str, timeout: int = 5) -> bool:
@@ -98,6 +109,61 @@ def wait_for_docker(timeout: int = 180) -> bool:
     return False
 
 
+def ensure_docker_runtime() -> str:
+    """Recover Docker, including a stale Colima VM whose daemon is unavailable."""
+    if docker_running():
+        return "ready"
+    system = platform.system()
+    if system == "Darwin":
+        if not COLIMA.is_file():
+            raise RuntimeError("Docker daemon 未运行；请启动 Docker Desktop")
+        if colima_running():
+            # A VM may report running while dockerd or its forwarded socket is
+            # unavailable. Give it a short grace period, then restart once.
+            if wait_for_docker(45):
+                return "recovered"
+            run([str(COLIMA), "restart"], timeout=600)
+            action = "restarted"
+        else:
+            architecture = (
+                "aarch64" if platform.machine() in {"arm64", "aarch64"} else "x86_64"
+            )
+            run(
+                [
+                    str(COLIMA),
+                    "start",
+                    "--cpus",
+                    os.environ.get("KHUB_COLIMA_CPUS", "4"),
+                    "--memory",
+                    os.environ.get("KHUB_COLIMA_MEMORY_GB", "10"),
+                    "--disk",
+                    os.environ.get("KHUB_COLIMA_DISK_GB", "80"),
+                    "--arch",
+                    architecture,
+                    "--vm-type",
+                    "vz",
+                    "--runtime",
+                    "docker",
+                ],
+                timeout=600,
+            )
+            action = "started"
+        if not wait_for_docker(180):
+            raise RuntimeError("Colima 已启动，但 Docker daemon 在 180 秒内仍不可用")
+        return action
+    if system == "Windows":
+        desktop = docker_desktop()
+        if desktop is None:
+            raise RuntimeError("Docker Desktop 未安装；请先安装 Docker Desktop for Windows")
+        subprocess.Popen(
+            [str(desktop)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if not wait_for_docker():
+            raise RuntimeError("Docker Desktop 启动超时")
+        return "started"
+    raise RuntimeError("Docker daemon 未运行；请启动 Docker Desktop")
+
+
 def compose_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment["KHUB_SEARXNG_CONFIG_DIR"] = str(
@@ -133,36 +199,7 @@ def ensure_services() -> dict[str, object]:
     if all(initial.values()) and docker_running():
         return {"action": "healthy", "services": initial}
 
-    if (
-        not docker_running()
-        and platform.system() == "Darwin"
-        and COLIMA.is_file()
-        and not colima_running()
-    ):
-        architecture = "aarch64" if platform.machine() in {"arm64", "aarch64"} else "x86_64"
-        run([
-            str(COLIMA), "start",
-            "--cpus", os.environ.get("KHUB_COLIMA_CPUS", "4"),
-            "--memory", os.environ.get("KHUB_COLIMA_MEMORY_GB", "10"),
-            "--disk", os.environ.get("KHUB_COLIMA_DISK_GB", "80"),
-            "--arch", architecture, "--vm-type", "vz", "--runtime", "docker",
-        ], timeout=600)
-    elif not docker_running() and platform.system() == "Windows":
-        desktop = docker_desktop()
-        if desktop is None:
-            raise RuntimeError("Docker Desktop 未安装；请先安装 Docker Desktop for Windows")
-        subprocess.Popen(
-            [str(desktop)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if not wait_for_docker():
-            raise RuntimeError("Docker Desktop 启动超时")
-    elif not docker_running() and not COLIMA.is_file():
-        raise RuntimeError("Docker daemon 未运行；请启动 Docker Desktop")
-
-    if not docker_running():
-        raise RuntimeError("Docker daemon 启动失败")
+    runtime_action = ensure_docker_runtime()
 
     onyx_env = ONYX_ENV if ONYX_ENV.is_file() else ROOT / "deploy" / ".env"
     compose_env = compose_environment()
@@ -182,7 +219,7 @@ def ensure_services() -> dict[str, object]:
     services = wait_for_services()
     if not all(services.values()):
         raise RuntimeError(f"服务健康检查超时：{services}")
-    return {"action": "started", "services": services}
+    return {"action": "started", "runtime": runtime_action, "services": services}
 
 
 def stop_services(purge: bool = False) -> dict[str, object]:
@@ -232,18 +269,36 @@ def main() -> int:
         print(json.dumps(stop_services(args.purge), ensure_ascii=False), flush=True)
         return 0
 
+    last_message = ""
+    repeated = 0
+    retry_delay = 30
     while True:
         try:
             result = ensure_services()
-            print(json.dumps(result, ensure_ascii=False), flush=True)
+            message = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            if message != last_message:
+                print(message, flush=True)
+                last_message = message
+                repeated = 0
             if args.once:
                 return 0
+            retry_delay = 30
             time.sleep(60)
         except Exception as exc:
-            print(json.dumps({"action": "error", "error": str(exc)}, ensure_ascii=False), flush=True)
+            payload = {"action": "error", "error": str(exc)}
+            message = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            repeated += 1
+            # Emit the first occurrence, every changed error, then one compact
+            # reminder every 30 repeats instead of flooding launchd logs.
+            if message != last_message or repeated % 30 == 0:
+                if repeated > 1:
+                    payload["repeated"] = repeated
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+                last_message = message
             if args.once:
                 return 1
-            time.sleep(30)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 300)
 
 
 if __name__ == "__main__":

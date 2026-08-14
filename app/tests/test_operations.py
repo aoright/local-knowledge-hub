@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,25 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(result["action"], "started")
         self.assertEqual(runner.call_count, 3)
         self.assertEqual(runner.call_args_list[0].args[0][0], str(colima))
+
+    def test_service_watchdog_restarts_stale_colima_daemon(self):
+        with tempfile.TemporaryDirectory() as value:
+            colima = Path(value) / "colima"
+            docker = Path(value) / "docker"
+            colima.touch()
+            docker.touch()
+            with (
+                mock.patch.object(start, "COLIMA", colima),
+                mock.patch.object(start, "DOCKER", docker),
+                mock.patch.object(start.platform, "system", return_value="Darwin"),
+                mock.patch.object(start, "docker_running", return_value=False),
+                mock.patch.object(start, "colima_running", return_value=True),
+                mock.patch.object(start, "wait_for_docker", side_effect=[False, True]),
+                mock.patch.object(start, "run") as runner,
+            ):
+                action = start.ensure_docker_runtime()
+        self.assertEqual(action, "restarted")
+        runner.assert_called_once_with([str(colima), "restart"], timeout=600)
 
     def test_exported_catalog_matches_gateway_tools(self):
         with tempfile.TemporaryDirectory() as value:
@@ -141,6 +161,129 @@ class OperationsTests(unittest.TestCase):
                 handle = maintenance.lock()
                 self.assertTrue(lock_file.is_file())
                 handle.close()
+
+    def test_unchanged_git_project_skips_repeated_full_scan(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            project = root / "project"
+            project.mkdir()
+            db_path = root / "knowledge.sqlite3"
+            state_path = root / "index-state.json"
+            original_connect = maintenance.kh.connect
+
+            db = original_connect(db_path)
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "alpha", "Alpha", str(project))
+            db.close()
+
+            with (
+                mock.patch.object(
+                    maintenance.kh,
+                    "connect",
+                    side_effect=lambda: original_connect(db_path),
+                ),
+                mock.patch.object(maintenance, "INDEX_STATE_FILE", state_path),
+                mock.patch.object(
+                    maintenance, "git_project_fingerprint", return_value="stable"
+                ),
+                mock.patch.object(
+                    maintenance.kh,
+                    "ingest_project",
+                    return_value=maintenance.kh.IngestStats(project="alpha"),
+                ) as ingest,
+                mock.patch.object(
+                    maintenance.kh, "maintain_memories", return_value={}
+                ),
+                mock.patch.object(
+                    maintenance.kh, "backfill_memory_embeddings", return_value={}
+                ),
+            ):
+                first = maintenance.ingest_all()
+                second = maintenance.ingest_all()
+
+            self.assertEqual(first["projects"], 1)
+            self.assertEqual(second["projects"], 0)
+            self.assertEqual(second["fingerprint_skipped"], 1)
+            self.assertEqual(ingest.call_count, 1)
+
+    def test_git_fingerprint_detects_untracked_file_edits(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("tracked", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", "commit", "-m", "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            untracked = root / "draft.txt"
+            untracked.write_text("first", encoding="utf-8")
+            first = maintenance.git_project_fingerprint({"paths": [str(root)]})
+            untracked.write_text("second version", encoding="utf-8")
+            second = maintenance.git_project_fingerprint({"paths": [str(root)]})
+            self.assertNotEqual(first, second)
+
+    def test_git_collection_fingerprint_tracks_nested_repositories(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            repository = root / "nested"
+            repository.mkdir()
+            subprocess.run(
+                ["git", "init", str(repository)], check=True, capture_output=True
+            )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("first", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked.txt"], check=True
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repository), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", "commit", "-m", "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            first = maintenance.git_project_fingerprint({"paths": [str(root)]})
+            tracked.write_text("second", encoding="utf-8")
+            second = maintenance.git_project_fingerprint({"paths": [str(root)]})
+            self.assertIsNotNone(first)
+            self.assertNotEqual(first, second)
+
+    def test_critical_backup_preserves_memory_but_drops_rebuildable_index(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            project = root / "project"
+            project.mkdir()
+            (project / "code.md").write_text("rebuildable code", encoding="utf-8")
+            db_path = root / "knowledge.sqlite3"
+            backup_dir = root / "backups"
+            db = maintenance.kh.connect(db_path)
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "alpha", "Alpha", str(project))
+            maintenance.kh.ingest_project(db, "alpha")
+            maintenance.kh.remember(
+                db, "alpha", "Durable", "Keep this memory", "constraint"
+            )
+
+            with (
+                mock.patch.object(maintenance, "BACKUP_DIR", backup_dir),
+                mock.patch.object(maintenance.kh, "connect", return_value=db),
+            ):
+                result = maintenance.backup(retain=2, mode="critical")
+                verified = maintenance.verify_backup(Path(result["backup"]))
+
+            self.assertEqual(result["mode"], "critical")
+            self.assertEqual(result["copied"]["documents"], 1)
+            self.assertEqual(verified["mode"], "critical")
+            self.assertEqual(verified["memories"], 1)
+            self.assertEqual(verified["documents"], 1)
+            self.assertFalse(any(backup_dir.glob("tmp*")))
 
 
 if __name__ == "__main__":
