@@ -47,6 +47,57 @@ class KnowledgeHubTests(unittest.TestCase):
         result = kh.search(self.db, "alpha", "visible-text")
         self.assertIn("[REDACTED_SECRET]", result[0]["content"])
 
+    def test_generated_test_logs_are_excluded_and_existing_noise_is_removed(self):
+        logs = self.root / "logs"
+        logs.mkdir()
+        generated = logs / "test.log"
+        generated.write_text("generated-test-log-marker", encoding="utf-8")
+        (logs / "runtime.log").write_text("useful-runtime-log-marker", encoding="utf-8")
+
+        source_key = f"{self.root.name}/logs/test.log"
+        document_id = kh.stable_document_id(
+            kh.get_project(self.db, "alpha")["id"], "file", source_key
+        )
+        now = kh.utcnow()
+        self.db.execute(
+            "INSERT INTO documents(id,project_id,source_type,source_key,title,relative_path,"
+            "source_uri,content_hash,byte_size,modified_at,indexed_at,metadata_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                document_id,
+                kh.get_project(self.db, "alpha")["id"],
+                "file",
+                source_key,
+                "logs/test.log",
+                "logs/test.log",
+                generated.as_uri(),
+                kh.sha256_bytes(b"generated-test-log-marker"),
+                generated.stat().st_size,
+                now,
+                now,
+                "{}",
+            ),
+        )
+        self.db.execute(
+            "INSERT INTO chunks(document_id,project_id,chunk_index,title,relative_path,content) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                document_id,
+                kh.get_project(self.db, "alpha")["id"],
+                0,
+                "logs/test.log",
+                "logs/test.log",
+                "generated-test-log-marker",
+            ),
+        )
+        self.db.commit()
+
+        stats = kh.ingest_project(self.db, "alpha")
+
+        self.assertEqual(stats.deleted, 1)
+        self.assertEqual(kh.search(self.db, "alpha", "generated-test-log-marker"), [])
+        self.assertEqual(len(kh.search(self.db, "alpha", "useful-runtime-log-marker")), 1)
+
     def test_secret_redaction_covers_chinese_credentials_and_commands(self):
         samples = [
             "服务器密码是 short-pass9，请不要泄露",
@@ -84,6 +135,8 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIn('"knowledge_search"', encoded)
         remember_tool = next(tool for tool in tools if tool["name"] == "knowledge_remember")
         self.assertIs(remember_tool["inputSchema"]["properties"]["confirmed"]["const"], True)
+        capture_tool = next(tool for tool in tools if tool["name"] == "knowledge_capture")
+        self.assertNotIn("confidence", capture_tool["inputSchema"]["required"])
         self.assertIn("knowledge_context", [tool["name"] for tool in tools])
         self.assertIn("knowledge_capture", [tool["name"] for tool in tools])
         self.assertEqual(len(tools), 13)
@@ -209,6 +262,56 @@ class KnowledgeHubTests(unittest.TestCase):
                 "All projects use weak-global-marker", "fact",
                 "所有项目使用 weak-global-marker", 0.95,
             )
+
+    def test_auto_capture_defaults_confidence_without_weakening_scope_rules(self):
+        project_memory = kh.capture_memory_auto(
+            self.db, "auto", "alpha", str(self.root), "Project default",
+            "This project keeps project-default-marker", "fact",
+            "这个项目长期使用 project-default-marker",
+        )
+        global_memory = kh.capture_memory_auto(
+            self.db, "auto", "alpha", str(self.root), "Global default",
+            "All projects keep global-default-marker", "constraint",
+            "所有项目必须使用 global-default-marker",
+        )
+        self.assertEqual(project_memory["resolved_scope"], "alpha")
+        self.assertEqual(project_memory["confidence"], 0.95)
+        self.assertTrue(project_memory["confidence_defaulted"])
+        self.assertEqual(global_memory["resolved_scope"], "global-engineering")
+        self.assertEqual(global_memory["confidence"], 0.99)
+
+    def test_context_always_returns_memory_completion_protocol(self):
+        (self.root / "note.md").write_text("completion-protocol-marker", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        context = kh.context_search(self.db, "alpha", "completion-protocol-marker")
+        self.assertTrue(context["completion_actions"]["memory_review_required"])
+        self.assertIn("knowledge_capture", context["completion_actions"]["instruction"])
+
+    def test_empty_scope_search_short_circuits_before_fts(self):
+        with mock.patch.object(kh, "fts_query", side_effect=AssertionError("FTS should not run")):
+            self.assertEqual(kh.search(self.db, "global-engineering", "empty-global-marker"), [])
+        details = json.loads(
+            self.db.execute(
+                "SELECT details_json FROM audit_log WHERE action='knowledge.search' ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertEqual(details["short_circuit"], "empty_scope")
+
+    def test_semantic_search_skips_embedding_when_scope_has_no_memories(self):
+        project_id = kh.get_project(self.db, "alpha")["id"]
+        with mock.patch.object(kh, "embed_query", side_effect=AssertionError("embedding should not run")):
+            self.assertEqual(
+                kh.semantic_search_memories(self.db, [project_id], "no-memory-marker"), []
+            )
+
+    def test_query_embedding_is_cached_across_scope_searches(self):
+        kh.embed_query.cache_clear()
+        sentinel = object()
+        with mock.patch.object(kh, "embed_texts", return_value=[sentinel]) as embed:
+            self.assertIs(kh.embed_query("same-query-marker"), sentinel)
+            self.assertIs(kh.embed_query("same-query-marker"), sentinel)
+        self.assertEqual(embed.call_count, 1)
+        kh.embed_query.cache_clear()
 
     def test_context_combines_project_and_global_without_cross_project_leak(self):
         other_root = Path(self.tmp.name) / "other"

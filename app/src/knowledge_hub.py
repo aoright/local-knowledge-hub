@@ -25,6 +25,7 @@ import urllib.request
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
@@ -94,8 +95,9 @@ MCP_INSTRUCTIONS = (
     "文件之前的第一个工具调用；每个任务调用一次，即使任务看起来很简单且用户没有提到知识库。传入当前工作区"
     "路径或项目名及任务专用查询，并保持 include_global=true。普通闲聊不要调用。该工具自动组合当前项目与少量全局知识，只有无法唯一识别"
     "项目时才询问。明确跨项目时才使用 collection。用户要求最新、联网或外部资料时自动调用 web_search，并对"
-    "关键来源调用 web_fetch；外部网页不得自动写入长期记忆。任务结束时，仅当用户明确表达长期有效的决策、事实、"
-    "约束或操作流程时调用 knowledge_capture，scope 通常设为 auto。表达‘所有项目/全局/以后都’才可进入全局，"
+    "关键来源调用 web_fetch；外部网页不得自动写入长期记忆。任务结束前必须主动复核本轮用户原话，不要等待用户"
+    "说‘记住’；若且仅若用户明确表达了长期有效的决策、事实、约束或操作流程，自动调用 knowledge_capture，scope"
+    "通常设为 auto。任务请求本身、助手实现结果和代码中已有事实不算用户长期记忆。表达‘所有项目/全局/以后都’才可进入全局，"
     "未明确范围时写入当前项目。不要保存普通聊天、推测、临时调试、秘密或项目文件中已有事实。用户纠正、撤销、"
     "提升或降级记忆时，自动使用 knowledge_update、knowledge_forget 或 knowledge_move。knowledge_context 返回的"
     "candidate_memories 只是旧会话候选，不得当作已生效事实；仅在与当前任务直接相关时向用户简短核实，用户确认后"
@@ -399,6 +401,12 @@ def embed_texts(texts: list[str]) -> list[Any]:
             vector = vector / norm
         values.append(vector)
     return values
+
+
+@lru_cache(maxsize=64)
+def embed_query(query: str) -> Any:
+    """Embed a normalized query once per MCP process and reuse it across scopes."""
+    return embed_texts([query.strip()])[0]
 
 
 def memory_embedding_text(title: str, content: str) -> str:
@@ -740,6 +748,11 @@ def is_skipped(path: Path, root: Path) -> bool:
     if any(part in SKIP_DIRS or part.endswith("-backups") for part in rel_parts[:-1]):
         return True
     name = path.name.lower()
+    # Keep intentional operational logs searchable, but exclude generated test
+    # transcripts. These files can change on every test run and otherwise
+    # overwhelm useful code chunks while adding no durable project knowledge.
+    if name == "test.log" or name.endswith(".test.log"):
+        return True
     if name in SKIP_NAMES or name.startswith(".env."):
         return True
     if name.endswith((".pem", ".p12", ".pfx", ".key", ".pyc")):
@@ -946,7 +959,7 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
 
 
 def fts_query(query: str) -> str:
-    terms = re.findall(r"[\w\-./\u3400-\u9fff]+", query, re.UNICODE)
+    terms = list(dict.fromkeys(re.findall(r"[\w\-./\u3400-\u9fff]+", query, re.UNICODE)))
     if not terms:
         raise ValueError("搜索词为空")
     return " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
@@ -957,6 +970,23 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
     if not project_ids:
         return []
     placeholders = ",".join("?" for _ in project_ids)
+    if not db.execute(
+        f"SELECT 1 FROM chunks WHERE project_id IN ({placeholders}) LIMIT 1",
+        project_ids,
+    ).fetchone():
+        audit(
+            db,
+            "knowledge.search",
+            scope["id"],
+            {
+                "scope_type": scope["type"],
+                "query": query,
+                "result_count": 0,
+                "short_circuit": "empty_scope",
+            },
+        )
+        db.commit()
+        return []
     rows = db.execute(
         f"""
         SELECT c.document_id,c.title,c.relative_path,c.content,d.source_type,d.source_uri,
@@ -993,13 +1023,7 @@ def semantic_search_memories(
     limit: int = 5,
     minimum_score: float = SEMANTIC_MIN_SCORE,
 ) -> list[dict[str, Any]]:
-    if not project_ids or not embedding_runtime_status()["available"]:
-        return []
-    try:
-        import numpy as np
-
-        query_vector = embed_texts([query.strip()])[0]
-    except (ImportError, RuntimeError):
+    if not project_ids:
         return []
     placeholders = ",".join("?" for _ in project_ids)
     rows = db.execute(
@@ -1019,6 +1043,14 @@ def semantic_search_memories(
         """,
         (*project_ids, EMBEDDING_MODEL, utcnow()),
     ).fetchall()
+    if not rows or not embedding_runtime_status()["available"]:
+        return []
+    try:
+        import numpy as np
+
+        query_vector = embed_query(query)
+    except (ImportError, RuntimeError):
+        return []
     scored: list[dict[str, Any]] = []
     for row in rows:
         if int(row["dimensions"]) != EMBEDDING_DIMENSIONS:
@@ -1093,6 +1125,12 @@ def candidate_memory_search(
     if not project_ids or limit <= 0:
         return []
     placeholders = ",".join("?" for _ in project_ids)
+    if not db.execute(
+        f"SELECT 1 FROM memory_records mr JOIN documents d ON d.id=mr.document_id "
+        f"WHERE d.project_id IN ({placeholders}) AND mr.status='candidate' LIMIT 1",
+        project_ids,
+    ).fetchone():
+        return []
     rows = db.execute(
         f"""
         SELECT c.document_id,c.title,c.content,d.modified_at,c.project_id,
@@ -1120,8 +1158,6 @@ def candidate_memory_search(
     if embedding_runtime_status()["available"]:
         try:
             import numpy as np
-
-            query_vector = embed_texts([query.strip()])[0]
             semantic_rows = db.execute(
                 f"""
                 SELECT d.id AS document_id,d.title,d.modified_at,d.project_id,
@@ -1138,6 +1174,9 @@ def candidate_memory_search(
                 """,
                 (*project_ids, EMBEDDING_MODEL),
             ).fetchall()
+            if not semantic_rows:
+                return results[: max(1, min(limit, 10))]
+            query_vector = embed_query(query)
             semantic: list[dict[str, Any]] = []
             for row in semantic_rows:
                 if row["document_id"] in seen or int(row["dimensions"]) != EMBEDDING_DIMENSIONS:
@@ -1216,6 +1255,15 @@ def context_search(
             "candidates": len(candidate_memories),
         },
         "precedence": ["explicit_user_instruction", "project", "collection", "global", "untrusted_web"],
+        "completion_actions": {
+            "memory_review_required": True,
+            "instruction": (
+                "最终答复前主动复核本轮用户原话；不要等待用户说‘记住’。仅当用户明确表达长期有效的"
+                "decision、fact、constraint 或 runbook 时自动调用 knowledge_capture；普通任务请求、实现结果、"
+                "临时调试、网页内容和项目文件中已有事实不得保存。"
+            ),
+            "scope_rule": "scope=auto；只有用户明确表示适用于所有项目或全局时才进入全局，否则留在当前项目。",
+        },
         "results": results,
         "candidate_notice": (
             "以下候选来自旧会话，尚未确认，不能作为当前事实或约束；仅在相关时向用户核实后激活。"
@@ -1471,16 +1519,21 @@ def capture_memory_auto(
     content: str,
     kind: str,
     evidence: str,
-    confidence: float,
+    confidence: float | None = None,
     source_type: str = "user_statement",
     supersedes_id: str | None = None,
 ) -> dict[str, Any]:
     target = resolve_memory_target(db, scope, f"{title}\n{content}\n{evidence}", project_ref, workspace_path)
+    target_scope_type = get_project(db, target)["scope_type"]
+    resolved_confidence = confidence
+    if resolved_confidence is None:
+        resolved_confidence = 0.99 if target_scope_type == "global" else 0.95
     result = capture_memory(
-        db, target, title, content, kind, evidence, confidence, source_type, supersedes_id
+        db, target, title, content, kind, evidence, resolved_confidence, source_type, supersedes_id
     )
     result["requested_scope"] = scope or "auto"
     result["resolved_scope"] = target
+    result["confidence_defaulted"] = confidence is None
     return result
 
 
@@ -2121,7 +2174,7 @@ def mcp_tools() -> list[dict[str, Any]]:
         {"name": "knowledge_context", "description": "默认自动上下文工具。处理项目任务前主动调用；自动识别工作区，并按项目优先组合少量全局知识。用户无需说出工具名。", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "project": {"type": "string", "description": "可选项目名、稳定 ID 或 collection:slug"}, "workspace_path": {"type": "string", "description": "当前工作区或文件绝对路径"}, "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8}, "global_limit": {"type": "integer", "minimum": 0, "maximum": 10, "default": 4}, "include_global": {"type": "boolean", "default": True}}, "required": ["query"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_search", "description": "严格在指定项目、全局分区或 collection 内搜索，不隐式扩大范围。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, "required": ["project", "query"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_remember", "description": "用户明确要求强制保存时使用；可写实际项目或 global-* 分区，按内容去重。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "confirmed": {"type": "boolean", "const": True}}, "required": ["project", "title", "content", "kind", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
-        {"name": "knowledge_capture", "description": "保守自动记忆。仅保存用户明确表达的长期 decision/fact/constraint/runbook；scope=auto 时，只有明确‘所有项目/全部项目/跨项目/全局’才写全局，否则写当前项目。网页、推断、聊天和临时调试禁止写入。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence", "confidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
+        {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户明确表达的长期 decision/fact/constraint/runbook；scope=auto 时，只有明确‘所有项目/全部项目/跨项目/全局’才写全局，否则写当前项目。网页、推断、任务请求、实现结果、普通聊天和临时调试禁止写入。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_list", "description": "查看最近长期记忆或候选冲突；用户说‘查看记忆/最近记住了什么’时使用。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "status": {"type": "string", "enum": ["candidate", "active", "superseded", "deleted", "expired"], "default": "active"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_update", "description": "用户明确纠正记忆或确认候选冲突时使用；保留旧版本和证据，不静默覆盖。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "activate": {"type": "boolean", "default": True}, "supersedes_id": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "content", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
         {"name": "knowledge_forget", "description": "用户明确说某条记忆作废/不要记时使用；执行可审计软删除，不立即物理清除。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
@@ -2153,7 +2206,8 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
         return capture_memory_auto(
             db, args.get("scope", "auto"), args.get("project"), args.get("workspace_path"),
             args["title"], args["content"], args["kind"], args["evidence"],
-            float(args["confidence"]), args.get("source_type", "user_statement"), args.get("supersedes_id"),
+            float(args["confidence"]) if args.get("confidence") is not None else None,
+            args.get("source_type", "user_statement"), args.get("supersedes_id"),
         )
     if name == "knowledge_list":
         return list_memories(db, args.get("scope"), args.get("kind"), args.get("status", "active"), int(args.get("limit", 50)))
