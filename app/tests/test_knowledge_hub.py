@@ -137,6 +137,14 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIs(remember_tool["inputSchema"]["properties"]["confirmed"]["const"], True)
         capture_tool = next(tool for tool in tools if tool["name"] == "knowledge_capture")
         self.assertNotIn("confidence", capture_tool["inputSchema"]["required"])
+        context_tool = next(tool for tool in tools if tool["name"] == "knowledge_context")
+        self.assertEqual(
+            context_tool["inputSchema"]["required"], ["query", "workspace_path"]
+        )
+        self.assertEqual(
+            context_tool["inputSchema"]["properties"]["workspace_path"]["minLength"],
+            1,
+        )
         self.assertIn("knowledge_context", [tool["name"] for tool in tools])
         self.assertIn("knowledge_capture", [tool["name"] for tool in tools])
         self.assertEqual(len(tools), 13)

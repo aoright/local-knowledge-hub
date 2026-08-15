@@ -85,7 +85,9 @@ fall through to another project. Context lookup uses a project-partitioned full-
 index and returns its lexical fast path immediately while the optional embedding
 model warms in the background. Web search retries through SearXNG's default engines
 and a conservatively simplified query when configured engines return no usable
-results.
+results. The `knowledge_context` tool schema requires `workspace_path`, preventing
+IDE clients from silently issuing an unscoped query when the MCP process itself was
+started from `/`.
 
 ## Commands
 

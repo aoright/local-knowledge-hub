@@ -28,6 +28,8 @@ class InstallManagerTests(unittest.TestCase):
         self.assertNotIn(manager.MANAGED_BEGIN, removed)
         self.assertIn("do not wait for the user", manager.INSTRUCTIONS)
         self.assertIn("call `knowledge_capture` automatically", manager.INSTRUCTIONS)
+        self.assertIn("`workspace_path` is mandatory", manager.INSTRUCTIONS)
+        self.assertIn("never call it with only `query`", manager.INSTRUCTIONS)
 
     def test_antigravity_rule_uses_official_global_gemini_file(self):
         with tempfile.TemporaryDirectory() as value:
