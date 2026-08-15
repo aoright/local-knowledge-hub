@@ -87,7 +87,11 @@ model warms in the background. Web search retries through SearXNG's default engi
 and a conservatively simplified query when configured engines return no usable
 results. The `knowledge_context` tool schema requires `workspace_path`, preventing
 IDE clients from silently issuing an unscoped query when the MCP process itself was
-started from `/`.
+started from `/`. If Antigravity omits the field anyway, the gateway reads only the
+most recently user-active conversation's local workspace metadata, requires a unique
+recent match, and resolves that path without reading conversation content. A new Git
+workspace is registered and indexed automatically; stale or ambiguous activity still
+fails closed.
 
 ## Commands
 

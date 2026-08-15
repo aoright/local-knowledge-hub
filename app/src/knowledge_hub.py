@@ -15,7 +15,9 @@ import json
 import os
 import re
 import shutil
+import shlex
 import socket
+import ssl
 import sqlite3
 import subprocess
 import sys
@@ -917,6 +919,185 @@ def resolve_project_reference(
         "无法自动识别当前项目；请让客户端传入当前工作区的绝对路径或项目名",
         suggestions,
     )
+
+
+def path_from_file_uri(value: str) -> str | None:
+    if value.startswith("file://"):
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.netloc not in {"", "localhost"}:
+            return None
+        value = urllib.parse.unquote(parsed.path)
+    if not os.path.isabs(value):
+        return None
+    return str(Path(value).resolve(strict=False))
+
+
+def antigravity_summary_workspace(summary: dict[str, Any]) -> str | None:
+    candidates: list[str] = []
+    metadata = summary.get("trajectoryMetadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            value for value in metadata.get("workspaceUris", [])
+            if isinstance(value, str)
+        )
+        workspaces = metadata.get("workspaces", [])
+        if isinstance(workspaces, list):
+            for workspace in workspaces:
+                if isinstance(workspace, dict):
+                    candidates.extend(
+                        workspace[key] for key in (
+                            "workspaceFolderAbsoluteUri", "gitRootAbsoluteUri"
+                        ) if isinstance(workspace.get(key), str)
+                    )
+    workspaces = summary.get("workspaces", [])
+    if isinstance(workspaces, list):
+        for workspace in workspaces:
+            if isinstance(workspace, dict):
+                candidates.extend(
+                    workspace[key] for key in (
+                        "workspaceFolderAbsoluteUri", "gitRootAbsoluteUri"
+                    ) if isinstance(workspace.get(key), str)
+                )
+    for candidate in candidates:
+        path = path_from_file_uri(candidate)
+        if path:
+            return path
+    return None
+
+
+def parse_external_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def select_recent_antigravity_workspace(
+    summaries: dict[str, dict[str, Any]],
+    now: float | None = None,
+    max_age_seconds: float = 600,
+    ambiguity_window_seconds: float = 2,
+) -> str | None:
+    """Select a unique, recently user-active Antigravity workspace."""
+    ranked: list[tuple[float, str]] = []
+    for summary in summaries.values():
+        workspace = antigravity_summary_workspace(summary)
+        timestamp = parse_external_timestamp(summary.get("lastUserInputTime"))
+        if timestamp is None:
+            timestamp = parse_external_timestamp(summary.get("lastModifiedTime"))
+        if workspace and timestamp is not None:
+            ranked.append((timestamp, workspace))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    current_time = time.time() if now is None else now
+    latest_time = ranked[0][0]
+    if current_time - latest_time > max_age_seconds or latest_time - current_time > 60:
+        return None
+    recent_roots = {
+        workspace for timestamp, workspace in ranked
+        if latest_time - timestamp <= ambiguity_window_seconds
+    }
+    return next(iter(recent_roots)) if len(recent_roots) == 1 else None
+
+
+def antigravity_active_workspace(timeout: float = 2.0) -> str | None:
+    """Read only the parent Antigravity process's loopback summary metadata."""
+    if sys.platform != "darwin" or not shutil.which("ps") or not shutil.which("lsof"):
+        return None
+    try:
+        command = subprocess.run(
+            ["ps", "-p", str(os.getppid()), "-o", "args="],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        ).stdout.strip()
+        arguments = shlex.split(command)
+        if not arguments or "language_server" not in Path(arguments[0]).name:
+            return None
+        token = arguments[arguments.index("--csrf_token") + 1]
+        ports_output = subprocess.run(
+            ["lsof", "-Pan", "-p", str(os.getppid()), "-iTCP", "-sTCP:LISTEN"],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        ).stdout
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+    ports = sorted({
+        int(match) for match in re.findall(
+            r"TCP\s+127\.0\.0\.1:(\d+)\s+\(LISTEN\)", ports_output
+        )
+    })
+    context = ssl._create_unverified_context()
+    service = "exa.language_server_pb.LanguageServerService"
+    for port in ports:
+        request = urllib.request.Request(
+            f"https://127.0.0.1:{port}/{service}/GetAllCascadeTrajectories",
+            data=b"{}",
+            headers={
+                "content-type": "application/json",
+                "x-codeium-csrf-token": token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, context=context, timeout=timeout
+            ) as response:
+                payload = json.loads(response.read(4_000_000))
+        except (OSError, ValueError):
+            continue
+        summaries = payload.get("trajectorySummaries")
+        if isinstance(summaries, dict):
+            return select_recent_antigravity_workspace({
+                str(key): value for key, value in summaries.items()
+                if isinstance(value, dict)
+            })
+    return None
+
+
+def slugify_project_name(value: str) -> str:
+    value = urllib.parse.unquote(value).strip().lower().replace("/", "-")
+    value = re.sub(r"\s+", "-", value)
+    value = re.sub(r"[^\w.\-\u3400-\u9fff]+", "-", value, flags=re.UNICODE)
+    return value.strip("-.") or "project"
+
+
+def register_active_workspace(db: sqlite3.Connection, workspace_path: str) -> str:
+    """Register and index a validated active IDE workspace that is not known yet."""
+    workspace = Path(workspace_path).expanduser().resolve(strict=False)
+    if (
+        not workspace.is_dir()
+        or workspace in {Path("/"), Path.home().resolve()}
+        or not (workspace / ".git").exists()
+    ):
+        raise ProjectResolutionError(
+            "unresolved_project",
+            "活动工作区尚未登记，且不是可安全自动创建的 Git 项目",
+        )
+    existing = db.execute(
+        "SELECT p.slug FROM project_paths pp JOIN projects p ON p.id=pp.project_id "
+        "WHERE pp.path=? AND pp.active=1",
+        (str(workspace),),
+    ).fetchone()
+    if existing:
+        return existing["slug"]
+    base = slugify_project_name(workspace.name)
+    slug = base
+    suffix = 2
+    while db.execute("SELECT 1 FROM projects WHERE slug=?", (slug,)).fetchone():
+        slug = f"{base}-{suffix}"
+        suffix += 1
+    project = add_project(db, slug, workspace.name, str(workspace))
+    report = ingest_project(db, project["slug"])
+    audit(db, "project.auto_registered", project["id"], {
+        "slug": project["slug"],
+        "path": str(workspace),
+        "indexed": report.indexed,
+        "chunks": report.chunks,
+        "source": "antigravity_active_workspace",
+    })
+    db.commit()
+    return project["slug"]
 
 
 def is_skipped(path: Path, root: Path) -> bool:
@@ -2517,7 +2698,12 @@ def mcp_tools() -> list[dict[str, Any]]:
     ]
 
 
-def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
+def mcp_call(
+    db: sqlite3.Connection,
+    name: str,
+    args: dict[str, Any],
+    client_name: str | None = None,
+) -> Any:
     if name == "knowledge_projects":
         current_status = status(db)
         return {key: current_status[key] for key in ("projects", "global_scopes", "collection_memory_scopes", "collections")}
@@ -2525,18 +2711,49 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
         project_ref = resolve_project_reference(db, args.get("project"))
         return search(db, project_ref, args["query"], int(args.get("limit", 10)))
     if name == "knowledge_context":
+        resolution_source = "arguments"
+        project_hint = args.get("project")
+        workspace_hint = args.get("workspace_path")
+        if (
+            not project_hint
+            and not workspace_hint
+            and (client_name or "").casefold().startswith("antigravity")
+        ):
+            workspace_hint = antigravity_active_workspace()
+            resolution_source = "antigravity_active_workspace"
         try:
-            project_ref = resolve_project_reference(
-                db, args.get("project"), args.get("workspace_path")
+            project_ref = resolve_project_reference(db, project_hint, workspace_hint)
+        except ProjectResolutionError as initial_error:
+            if resolution_source == "antigravity_active_workspace" and workspace_hint:
+                try:
+                    project_ref = register_active_workspace(db, workspace_hint)
+                except ProjectResolutionError as exc:
+                    value = unresolved_context_response(
+                        exc, str(args.get("query", "")),
+                        bool(args.get("include_global", True)),
+                    )
+                    value["resolution_source"] = resolution_source
+                    return value
+            else:
+                exc = initial_error
+                value = unresolved_context_response(
+                    exc, str(args.get("query", "")), bool(args.get("include_global", True))
+                )
+                value["resolution_source"] = resolution_source
+                return value
+        except ValueError as exc:
+            value = unresolved_context_response(
+                ProjectResolutionError("unresolved_project", str(exc)),
+                str(args.get("query", "")), bool(args.get("include_global", True))
             )
-        except ProjectResolutionError as exc:
-            return unresolved_context_response(
-                exc, str(args.get("query", "")), bool(args.get("include_global", True))
-            )
-        return context_search(
+            value["resolution_source"] = resolution_source
+            return value
+        value = context_search(
             db, project_ref, args["query"], int(args.get("limit", 8)),
             int(args.get("global_limit", 4)), bool(args.get("include_global", True)),
         )
+        value["resolution_source"] = resolution_source
+        return value
     if name == "knowledge_remember":
         if args.get("confirmed") is not True:
             raise ValueError("写入长期记忆需要用户明确确认（confirmed=true）")
@@ -2635,7 +2852,9 @@ def mcp_server(db_path: Path) -> None:
                 tool_name = str(params.get("name", ""))
                 started = time.monotonic()
                 try:
-                    value = mcp_call(db, tool_name, params.get("arguments", {}))
+                    value = mcp_call(
+                        db, tool_name, params.get("arguments", {}), client_info.get("name")
+                    )
                 except Exception as exc:
                     audit(
                         db,

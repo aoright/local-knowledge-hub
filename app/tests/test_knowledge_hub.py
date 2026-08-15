@@ -214,6 +214,82 @@ class KnowledgeHubTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             kh.resolve_project_reference(self.db, project_ref="definitely-not-a-project")
 
+    def test_selects_unique_recent_antigravity_workspace(self):
+        recent = "2026-08-15T06:00:00Z"
+        older = "2026-08-15T05:00:00Z"
+        summaries = {
+            "current": {
+                "lastUserInputTime": recent,
+                "workspaces": [{
+                    "workspaceFolderAbsoluteUri": "file:///tmp/current-project"
+                }],
+            },
+            "older": {
+                "lastUserInputTime": older,
+                "workspaces": [{
+                    "workspaceFolderAbsoluteUri": "file:///tmp/older-project"
+                }],
+            },
+        }
+        now = kh.datetime.fromisoformat(recent.replace("Z", "+00:00")).timestamp() + 5
+        self.assertEqual(
+            kh.select_recent_antigravity_workspace(summaries, now=now),
+            str(Path("/tmp/current-project").resolve(strict=False)),
+        )
+
+    def test_rejects_ambiguous_recent_antigravity_workspaces(self):
+        recent = "2026-08-15T06:00:00Z"
+        summaries = {
+            "one": {
+                "lastUserInputTime": recent,
+                "workspaces": [{"workspaceFolderAbsoluteUri": "file:///tmp/one"}],
+            },
+            "two": {
+                "lastUserInputTime": recent,
+                "workspaces": [{"workspaceFolderAbsoluteUri": "file:///tmp/two"}],
+            },
+        }
+        now = kh.datetime.fromisoformat(recent.replace("Z", "+00:00")).timestamp()
+        self.assertIsNone(kh.select_recent_antigravity_workspace(summaries, now=now))
+
+    def test_antigravity_context_uses_active_workspace_when_arguments_omit_scope(self):
+        with mock.patch.object(
+            kh, "antigravity_active_workspace", return_value=str(self.root)
+        ):
+            value = kh.mcp_call(
+                self.db,
+                "knowledge_context",
+                {"query": "automatic-scope-marker"},
+                client_name="antigravity-client",
+            )
+        self.assertEqual(value["scope"]["slug"], "alpha")
+        self.assertEqual(value["resolution_source"], "antigravity_active_workspace")
+
+    def test_antigravity_context_auto_registers_new_git_workspace(self):
+        workspace = Path(self.tmp.name) / "New Hardware Project"
+        workspace.mkdir()
+        (workspace / ".git").mkdir()
+        (workspace / "requirements.md").write_text(
+            "hardware-registration-bom-marker", encoding="utf-8"
+        )
+        with mock.patch.object(
+            kh, "antigravity_active_workspace", return_value=str(workspace)
+        ):
+            value = kh.mcp_call(
+                self.db,
+                "knowledge_context",
+                {"query": "hardware-registration-bom-marker"},
+                client_name="antigravity-client",
+            )
+        self.assertEqual(value["scope"]["slug"], "new-hardware-project")
+        self.assertEqual(value["result_counts"]["primary"], 1)
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE action='project.auto_registered'"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_resolve_project_accepts_unique_human_suffix_without_scope_leak(self):
         other_root = Path(self.tmp.name) / "nunu"
         other_root.mkdir()
