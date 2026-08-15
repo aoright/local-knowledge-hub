@@ -206,6 +206,90 @@ class KnowledgeHubTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             kh.resolve_project_reference(self.db, project_ref="definitely-not-a-project")
 
+    def test_resolve_project_accepts_unique_human_suffix_without_scope_leak(self):
+        other_root = Path(self.tmp.name) / "nunu"
+        other_root.mkdir()
+        kh.add_project(self.db, "nunu", "nunu", str(other_root))
+        server_root = other_root / "nunu-server-go-main"
+        server_root.mkdir()
+        kh.add_project(
+            self.db, "nunu-server-go-main", "nunu-server-go-main", str(server_root)
+        )
+
+        self.assertEqual(
+            kh.resolve_project_reference(
+                self.db, project_ref="nunu-server-go-main / 智能体测试"
+            ),
+            "nunu-server-go-main",
+        )
+        self.assertEqual(
+            kh.resolve_project_reference(
+                self.db, project_ref="project: nunu-server-go-main（后端）"
+            ),
+            "nunu-server-go-main",
+        )
+
+    def test_unresolved_context_returns_safe_resolution_request(self):
+        result = kh.mcp_call(
+            self.db,
+            "knowledge_context",
+            {"project": "definitely-not-a-project", "query": "marker"},
+        )
+        self.assertEqual(result["result_counts"]["primary"], 0)
+        self.assertEqual(
+            result["resolution_required"]["code"], "unresolved_project"
+        )
+        self.assertEqual(result["results"], [])
+
+    def test_mcp_failure_audit_records_safe_error_code_and_server_pid(self):
+        db_path = Path(self.tmp.name) / "mcp-error.sqlite3"
+        requests = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"clientInfo": {"name": "audit-test", "version": "1"}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "knowledge_search",
+                            "arguments": {
+                                "project": "definitely-not-a-project",
+                                "query": "marker",
+                            },
+                        },
+                    }
+                ),
+            )
+        ) + "\n"
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--db", str(db_path), "mcp"],
+            input=requests,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=True,
+        )
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(responses[1]["error"]["code"], -32000)
+        audit_db = sqlite3.connect(db_path)
+        details = json.loads(
+            audit_db.execute(
+                "SELECT details_json FROM audit_log WHERE action='mcp.tool_call'"
+            ).fetchone()[0]
+        )
+        audit_db.close()
+        self.assertEqual(details["error_code"], "unresolved_project")
+        self.assertEqual(details["error_class"], "ProjectResolutionError")
+        self.assertGreater(details["server_pid"], 0)
+
     def test_automatic_capture_is_strict_and_deduplicated(self):
         with self.assertRaises(ValueError):
             kh.capture_memory(
@@ -312,6 +396,97 @@ class KnowledgeHubTests(unittest.TestCase):
             self.assertIs(kh.embed_query("same-query-marker"), sentinel)
         self.assertEqual(embed.call_count, 1)
         kh.embed_query.cache_clear()
+
+    def test_context_never_blocks_on_cold_embedding_model(self):
+        with mock.patch.object(
+            kh,
+            "upsert_memory_embedding",
+            return_value={"embedded": False, "reason": "test"},
+        ):
+            memory = kh.remember(
+                self.db,
+                "alpha",
+                "Cold semantic memory",
+                "A differently worded durable architecture decision",
+                "decision",
+            )
+        self.db.execute(
+            "INSERT INTO memory_embeddings(document_id,model,dimensions,embedding,content_hash,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                memory["document_id"],
+                kh.EMBEDDING_MODEL,
+                kh.EMBEDDING_DIMENSIONS,
+                b"not-read-on-cold-path",
+                "test-hash",
+                kh.utcnow(),
+            ),
+        )
+        self.db.commit()
+        original_instance = kh._EMBEDDING_MODEL_INSTANCE
+        kh._EMBEDDING_MODEL_INSTANCE = None
+        try:
+            with mock.patch.object(
+                kh, "embed_query", side_effect=AssertionError("cold embedding should not run")
+            ):
+                context = kh.context_search(
+                    self.db, "alpha", "unrelated lexical query", 8, 4, True
+                )
+        finally:
+            kh._EMBEDDING_MODEL_INSTANCE = original_instance
+        self.assertEqual(context["semantic_mode"], "lexical_fast_path")
+
+    def test_initialize_migrates_legacy_fts_to_project_partition(self):
+        db_path = Path(self.tmp.name) / "legacy-fts.sqlite3"
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            """
+            CREATE TABLE chunks (
+              id INTEGER PRIMARY KEY,
+              document_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              relative_path TEXT,
+              content TEXT NOT NULL,
+              UNIQUE(document_id, chunk_index)
+            );
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(
+              title, relative_path, content,
+              content='chunks', content_rowid='id', tokenize='unicode61'
+            );
+            CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+              INSERT INTO chunks_fts(rowid,title,relative_path,content)
+              VALUES(new.id,new.title,new.relative_path,new.content);
+            END;
+            INSERT INTO chunks(document_id,project_id,chunk_index,title,relative_path,content)
+            VALUES('doc-one','project-one',0,'note','note.md','partition-migration-marker');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = kh.connect(db_path)
+        kh.initialize(migrated)
+        columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(chunks_fts)")
+        }
+        self.assertIn("project_id", columns)
+        self.assertEqual(
+            migrated.execute(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+                (kh.scoped_fts_query("partition-migration-marker", ["project-one"]),),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            migrated.execute(
+                "SELECT COUNT(*) FROM audit_log "
+                "WHERE action='index.fts_project_partition_migrated'"
+            ).fetchone()[0],
+            1,
+        )
+        migrated.close()
 
     def test_context_combines_project_and_global_without_cross_project_leak(self):
         other_root = Path(self.tmp.name) / "other"
@@ -428,6 +603,75 @@ class KnowledgeHubTests(unittest.TestCase):
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual(json.loads(failure[0])["reason"], "no_results")
+
+    def test_web_search_retries_with_searxng_default_engines(self):
+        unavailable = mock.MagicMock()
+        unavailable.__enter__.return_value = unavailable
+        unavailable.read.return_value = json.dumps(
+            {"results": [], "unresponsive_engines": [["bing", "timeout"]]}
+        ).encode()
+        recovered = mock.MagicMock()
+        recovered.__enter__.return_value = recovered
+        recovered.read.return_value = json.dumps(
+            {
+                "results": [{
+                    "title": "Python 3.14 release notes",
+                    "url": "https://docs.python.org/3.14/whatsnew/3.14.html",
+                    "content": "Official Python 3.14 release notes",
+                    "engine": "google",
+                }],
+                "unresponsive_engines": [],
+            }
+        ).encode()
+        with (
+            mock.patch.dict(kh.os.environ, {"KHUB_SEARXNG_ENGINES": "bing"}),
+            mock.patch.object(
+                kh.urllib.request, "urlopen", side_effect=[unavailable, recovered]
+            ) as opener,
+        ):
+            result = kh.web_search(self.db, "Python 3.14 release notes")
+
+        self.assertTrue(result["quality"]["fallback_used"])
+        self.assertEqual(result["quality"]["attempts"][1]["mode"], "default_engines")
+        self.assertIn("engines=bing", opener.call_args_list[0].args[0].full_url)
+        self.assertNotIn("engines=", opener.call_args_list[1].args[0].full_url)
+
+    def test_web_search_simplifies_query_after_empty_retries(self):
+        empty = mock.MagicMock()
+        empty.__enter__.return_value = empty
+        empty.read.return_value = json.dumps(
+            {"results": [], "unresponsive_engines": []}
+        ).encode()
+        recovered = mock.MagicMock()
+        recovered.__enter__.return_value = recovered
+        recovered.read.return_value = json.dumps(
+            {
+                "results": [{
+                    "title": "Python packaging guide",
+                    "url": "https://packaging.python.org/en/latest/guides/",
+                    "content": "Official Python packaging documentation",
+                    "engine": "google",
+                }],
+                "unresponsive_engines": [],
+            }
+        ).encode()
+        with (
+            mock.patch.dict(kh.os.environ, {"KHUB_SEARXNG_ENGINES": "bing"}),
+            mock.patch.object(
+                kh.urllib.request,
+                "urlopen",
+                side_effect=[empty, empty, recovered],
+            ) as opener,
+        ):
+            result = kh.web_search(
+                self.db, 'site:packaging.python.org 请搜索 "Python packaging" 官方资料'
+            )
+
+        self.assertTrue(result["quality"]["fallback_used"])
+        self.assertEqual(result["quality"]["attempts"][-1]["mode"], "simplified_query")
+        final_url = kh.urllib.parse.unquote(opener.call_args_list[-1].args[0].full_url)
+        self.assertIn("site:packaging.python.org", final_url)
+        self.assertNotIn("请搜索", final_url)
 
     def test_web_search_rejects_nonempty_but_irrelevant_results(self):
         response = mock.MagicMock()

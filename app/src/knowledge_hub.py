@@ -8,6 +8,7 @@ native conversation database.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import ipaddress
 import json
@@ -18,6 +19,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -43,6 +45,8 @@ EMBEDDING_DIMENSIONS = 384
 SEMANTIC_MIN_SCORE = float(os.environ.get("KHUB_SEMANTIC_MIN_SCORE", "0.45"))
 _EMBEDDING_MODEL_INSTANCE: Any | None = None
 _EMBEDDING_MODEL_ERROR: str | None = None
+_EMBEDDING_WARM_THREAD: threading.Thread | None = None
+_EMBEDDING_WARM_LOCK = threading.Lock()
 LEGACY_CONVERSATION_RUNTIME = Path(
     os.environ.get(
         "KHUB_LEGACY_CONVERSATION_RUNTIME",
@@ -111,6 +115,20 @@ GLOBAL_SCOPES = {
     "global-operations": "全局｜运维流程",
 }
 GLOBAL_COLLECTION_SLUG = "global-all"
+
+
+class ProjectResolutionError(ValueError):
+    """A safe, structured project-resolution failure for MCP clients and audit."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        candidates: Iterable[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.candidates = tuple(dict.fromkeys(candidates))[:8]
 GLOBAL_SCOPE_MARKERS = re.compile(
     r"(?:(?:所有|全部|任何|每个)项目|对所有项目|在所有项目|跨项目|全局|"
     r"all\s+projects|every\s+project|across\s+projects|globally)",
@@ -234,22 +252,22 @@ def initialize(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS documents_project_idx ON documents(project_id);
         CREATE INDEX IF NOT EXISTS chunks_project_idx ON chunks(project_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-          title, relative_path, content,
+          project_id, title, relative_path, content,
           content='chunks', content_rowid='id', tokenize='unicode61'
         );
         CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-          INSERT INTO chunks_fts(rowid,title,relative_path,content)
-          VALUES(new.id,new.title,new.relative_path,new.content);
+          INSERT INTO chunks_fts(rowid,project_id,title,relative_path,content)
+          VALUES(new.id,new.project_id,new.title,new.relative_path,new.content);
         END;
         CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-          INSERT INTO chunks_fts(chunks_fts,rowid,title,relative_path,content)
-          VALUES('delete',old.id,old.title,old.relative_path,old.content);
+          INSERT INTO chunks_fts(chunks_fts,rowid,project_id,title,relative_path,content)
+          VALUES('delete',old.id,old.project_id,old.title,old.relative_path,old.content);
         END;
         CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-          INSERT INTO chunks_fts(chunks_fts,rowid,title,relative_path,content)
-          VALUES('delete',old.id,old.title,old.relative_path,old.content);
-          INSERT INTO chunks_fts(rowid,title,relative_path,content)
-          VALUES(new.id,new.title,new.relative_path,new.content);
+          INSERT INTO chunks_fts(chunks_fts,rowid,project_id,title,relative_path,content)
+          VALUES('delete',old.id,old.project_id,old.title,old.relative_path,old.content);
+          INSERT INTO chunks_fts(rowid,project_id,title,relative_path,content)
+          VALUES(new.id,new.project_id,new.title,new.relative_path,new.content);
         END;
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY,
@@ -325,9 +343,65 @@ def initialize(db: sqlite3.Connection) -> None:
     project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
     if "scope_type" not in project_columns:
         db.execute("ALTER TABLE projects ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'project'")
+    db.commit()
+    ensure_project_partitioned_fts(db)
     ensure_global_scopes(db)
     migrate_existing_memories(db)
     db.commit()
+
+
+def ensure_project_partitioned_fts(db: sqlite3.Connection) -> bool:
+    """Upgrade the shared FTS index so project scope is part of MATCH itself."""
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks_fts)")}
+    if "project_id" in columns:
+        return False
+    started = time.monotonic()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks_fts)")}
+        if "project_id" in columns:
+            db.commit()
+            return False
+        for statement in (
+            "DROP TRIGGER IF EXISTS chunks_ai",
+            "DROP TRIGGER IF EXISTS chunks_ad",
+            "DROP TRIGGER IF EXISTS chunks_au",
+            "DROP TABLE IF EXISTS chunks_fts",
+            """CREATE VIRTUAL TABLE chunks_fts USING fts5(
+              project_id, title, relative_path, content,
+              content='chunks', content_rowid='id', tokenize='unicode61'
+            )""",
+            """CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+              INSERT INTO chunks_fts(rowid,project_id,title,relative_path,content)
+              VALUES(new.id,new.project_id,new.title,new.relative_path,new.content);
+            END""",
+            """CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+              INSERT INTO chunks_fts(chunks_fts,rowid,project_id,title,relative_path,content)
+              VALUES('delete',old.id,old.project_id,old.title,old.relative_path,old.content);
+            END""",
+            """CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+              INSERT INTO chunks_fts(chunks_fts,rowid,project_id,title,relative_path,content)
+              VALUES('delete',old.id,old.project_id,old.title,old.relative_path,old.content);
+              INSERT INTO chunks_fts(rowid,project_id,title,relative_path,content)
+              VALUES(new.id,new.project_id,new.title,new.relative_path,new.content);
+            END""",
+        ):
+            db.execute(statement)
+        db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        audit(
+            db,
+            "index.fts_project_partition_migrated",
+            None,
+            {
+                "chunks": db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+                "duration_ms": round((time.monotonic() - started) * 1000),
+            },
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
 
 
 def memory_document_content(db: sqlite3.Connection, document_id: str) -> str:
@@ -387,6 +461,32 @@ def get_embedding_model() -> Any:
     except Exception as exc:
         _EMBEDDING_MODEL_ERROR = str(exc)
         raise RuntimeError(f"本地向量模型不可用：{exc}") from exc
+
+
+def warm_embedding_model_async(delay_seconds: float = 0.25) -> bool:
+    """Warm the model after the first context response without blocking that response."""
+    global _EMBEDDING_WARM_THREAD
+    if _EMBEDDING_MODEL_INSTANCE is not None or not embedding_runtime_status()["available"]:
+        return False
+    with _EMBEDDING_WARM_LOCK:
+        if _EMBEDDING_WARM_THREAD is not None and _EMBEDDING_WARM_THREAD.is_alive():
+            return False
+
+        def worker() -> None:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            try:
+                get_embedding_model()
+            except RuntimeError:
+                pass
+
+        _EMBEDDING_WARM_THREAD = threading.Thread(
+            target=worker,
+            name="knowledge-hub-embedding-warmup",
+            daemon=True,
+        )
+        _EMBEDDING_WARM_THREAD.start()
+        return True
 
 
 def embed_texts(texts: list[str]) -> list[Any]:
@@ -677,13 +777,41 @@ def normalize_project_hint(value: str) -> str:
     return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", value.casefold())
 
 
+def project_resolution_suggestions(
+    db: sqlite3.Connection,
+    hints: Iterable[str],
+    limit: int = 5,
+) -> list[str]:
+    """Return non-sensitive project slugs that are close to a supplied hint."""
+    normalized_hints = [normalize_project_hint(value) for value in hints]
+    normalized_hints = [value for value in normalized_hints if value]
+    if not normalized_hints:
+        return []
+    choices: dict[str, str] = {}
+    for row in db.execute(
+        "SELECT slug,display_name FROM projects WHERE scope_type='project'"
+    ):
+        for value in (row["slug"], row["display_name"]):
+            normalized = normalize_project_hint(value)
+            if normalized:
+                choices.setdefault(normalized, row["slug"])
+    ranked: list[str] = []
+    for hint in normalized_hints:
+        for match in difflib.get_close_matches(hint, choices, n=limit, cutoff=0.45):
+            slug = choices[match]
+            if slug not in ranked:
+                ranked.append(slug)
+    return ranked[:limit]
+
+
 def resolve_project_reference(
     db: sqlite3.Connection,
     project_ref: str | None = None,
     workspace_path: str | None = None,
 ) -> str:
     """Resolve an explicit ref, workspace path, or human project hint."""
-    explicit = (project_ref or "").strip()
+    explicit = (project_ref or "").strip().strip("'\"")
+    explicit = re.sub(r"^(?:project|workspace|项目)\s*:\s*", "", explicit, flags=re.I)
     if explicit and explicit.casefold() not in {"auto", "current", "当前项目"}:
         try:
             scope, _ = resolve_scope(db, explicit)
@@ -691,7 +819,7 @@ def resolve_project_reference(
         except ValueError:
             pass
 
-    path_hint = (workspace_path or "").strip()
+    path_hint = (workspace_path or "").strip().strip("'\"")
     if path_hint.startswith("file://"):
         parsed = urllib.parse.urlparse(path_hint)
         path_hint = urllib.parse.unquote(parsed.path)
@@ -719,6 +847,7 @@ def resolve_project_reference(
     hints = [value for value in (explicit, path_hint, Path(path_hint).name if path_hint else "") if value]
     normalized_hints = {normalize_project_hint(value) for value in hints if normalize_project_hint(value)}
     matches: dict[str, str] = {}
+    fuzzy_scores: dict[str, tuple[int, str]] = {}
     for row in db.execute(
         "SELECT p.id,p.slug,p.display_name,pp.path FROM projects p "
         "LEFT JOIN project_paths pp ON pp.project_id=p.id AND pp.active=1 WHERE p.scope_type='project'"
@@ -726,21 +855,67 @@ def resolve_project_reference(
         names = {row["slug"], row["display_name"]}
         if row["path"]:
             names.add(Path(row["path"]).name)
-        if normalized_hints.intersection(normalize_project_hint(name) for name in names):
+        normalized_names = {
+            normalize_project_hint(name) for name in names if normalize_project_hint(name)
+        }
+        fuzzy_names = {
+            normalize_project_hint(name)
+            for name in (row["slug"], row["display_name"])
+            if normalize_project_hint(name)
+        }
+        if normalized_hints.intersection(normalized_names):
             matches[row["id"]] = row["slug"]
+        for hint in normalized_hints:
+            for normalized_name in fuzzy_names:
+                if len(normalized_name) < 4:
+                    continue
+                if normalized_name in hint:
+                    previous = fuzzy_scores.get(row["id"])
+                    score = len(normalized_name)
+                    if previous is None or score > previous[0]:
+                        fuzzy_scores[row["id"]] = (score, row["slug"])
     for row in db.execute(
         "SELECT pa.alias,p.id,p.slug FROM project_aliases pa JOIN projects p ON p.id=pa.project_id"
     ):
-        if normalize_project_hint(row["alias"]) in normalized_hints:
+        normalized_alias = normalize_project_hint(row["alias"])
+        if normalized_alias in normalized_hints:
             matches[row["id"]] = row["slug"]
+        for hint in normalized_hints:
+            if len(normalized_alias) >= 4 and normalized_alias in hint:
+                previous = fuzzy_scores.get(row["id"])
+                score = len(normalized_alias)
+                if previous is None or score > previous[0]:
+                    fuzzy_scores[row["id"]] = (score, row["slug"])
     if len(matches) == 1:
         return next(iter(matches.values()))
     if matches:
-        raise ValueError(f"项目提示不唯一，请从以下项目中选择：{', '.join(sorted(matches.values()))}")
+        candidates = sorted(matches.values())
+        raise ProjectResolutionError(
+            "ambiguous_project",
+            f"项目提示不唯一，请从以下项目中选择：{', '.join(candidates)}",
+            candidates,
+        )
+    if fuzzy_scores:
+        best_score = max(score for score, _ in fuzzy_scores.values())
+        best = sorted(
+            slug for score, slug in fuzzy_scores.values() if score == best_score
+        )
+        if len(best) == 1:
+            return best[0]
+        raise ProjectResolutionError(
+            "ambiguous_project",
+            f"项目提示不唯一，请从以下项目中选择：{', '.join(best)}",
+            best,
+        )
     process_cwd = Path.cwd().resolve()
     if not hints and process_cwd != Path("/"):
         return resolve_project_reference(db, workspace_path=str(process_cwd))
-    raise ValueError("无法自动识别当前项目；请让客户端传入当前工作区的绝对路径或项目名")
+    suggestions = project_resolution_suggestions(db, hints)
+    raise ProjectResolutionError(
+        "unresolved_project",
+        "无法自动识别当前项目；请让客户端传入当前工作区的绝对路径或项目名",
+        suggestions,
+    )
 
 
 def is_skipped(path: Path, root: Path) -> bool:
@@ -965,6 +1140,14 @@ def fts_query(query: str) -> str:
     return " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
 
 
+def scoped_fts_query(query: str, project_ids: list[str]) -> str:
+    terms = fts_query(query)
+    projects = " OR ".join(
+        '"' + project_id.replace('"', '""') + '"' for project_id in project_ids
+    )
+    return f"project_id:({projects}) AND ({terms})"
+
+
 def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10) -> list[dict[str, Any]]:
     scope, project_ids = resolve_scope(db, project_ref)
     if not project_ids:
@@ -993,7 +1176,7 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
                d.modified_at,c.project_id,p.slug AS scope_key,p.display_name AS scope_name,
                p.scope_type,mr.kind AS memory_kind,mr.status AS memory_status,
                mr.confidence AS memory_confidence,mr.evidence AS memory_evidence,
-               bm25(chunks_fts,4.0,2.0,1.0) AS score
+               bm25(chunks_fts,0.0,4.0,2.0,1.0) AS score
         FROM chunks_fts
         JOIN chunks c ON c.id=chunks_fts.rowid
         JOIN documents d ON d.id=c.document_id
@@ -1006,7 +1189,7 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
           ))
         ORDER BY score LIMIT ?
         """,
-        (fts_query(query), *project_ids, utcnow(), max(1, min(limit, 50))),
+        (scoped_fts_query(query, project_ids), *project_ids, utcnow(), max(1, min(limit, 50))),
     ).fetchall()
     audit(db, "knowledge.search", scope["id"], {"scope_type": scope["type"], "query": query, "result_count": len(rows)})
     db.commit()
@@ -1022,6 +1205,7 @@ def semantic_search_memories(
     query: str,
     limit: int = 5,
     minimum_score: float = SEMANTIC_MIN_SCORE,
+    allow_cold_start: bool = True,
 ) -> list[dict[str, Any]]:
     if not project_ids:
         return []
@@ -1043,7 +1227,11 @@ def semantic_search_memories(
         """,
         (*project_ids, EMBEDDING_MODEL, utcnow()),
     ).fetchall()
-    if not rows or not embedding_runtime_status()["available"]:
+    if (
+        not rows
+        or (not allow_cold_start and _EMBEDDING_MODEL_INSTANCE is None)
+        or not embedding_runtime_status()["available"]
+    ):
         return []
     try:
         import numpy as np
@@ -1082,10 +1270,17 @@ def hybrid_scope_search(
     scope_ref: str,
     query: str,
     limit: int,
+    allow_embedding_cold_start: bool = True,
 ) -> list[dict[str, Any]]:
     lexical = search(db, scope_ref, query, limit)
     _, project_ids = resolve_scope(db, scope_ref)
-    semantic = semantic_search_memories(db, project_ids, query, min(limit, 10))
+    semantic = semantic_search_memories(
+        db,
+        project_ids,
+        query,
+        min(limit, 10),
+        allow_cold_start=allow_embedding_cold_start,
+    )
     if not semantic:
         return lexical
 
@@ -1120,6 +1315,7 @@ def candidate_memory_search(
     project_ids: list[str],
     query: str,
     limit: int = 3,
+    allow_embedding_cold_start: bool = True,
 ) -> list[dict[str, Any]]:
     """Return relevant unconfirmed memories separately from trusted context."""
     if not project_ids or limit <= 0:
@@ -1137,7 +1333,7 @@ def candidate_memory_search(
                p.slug AS scope_key,p.display_name AS scope_name,p.scope_type,
                mr.kind AS memory_kind,mr.status AS memory_status,
                mr.confidence AS memory_confidence,mr.evidence AS memory_evidence,
-               mr.valid_from,bm25(chunks_fts,4.0,2.0,1.0) AS score
+               mr.valid_from,bm25(chunks_fts,0.0,4.0,2.0,1.0) AS score
         FROM chunks_fts
         JOIN chunks c ON c.id=chunks_fts.rowid
         JOIN documents d ON d.id=c.document_id
@@ -1147,7 +1343,7 @@ def candidate_memory_search(
           AND d.source_type='memory' AND mr.status='candidate'
         ORDER BY score,mr.updated_at DESC LIMIT ?
         """,
-        (fts_query(query), *project_ids, max(1, min(limit, 10))),
+        (scoped_fts_query(query, project_ids), *project_ids, max(1, min(limit, 10))),
     ).fetchall()
     results = [dict(row) for row in rows]
     for item in results:
@@ -1155,7 +1351,10 @@ def candidate_memory_search(
         item["retrieval_method"] = "lexical"
         item["review_required"] = True
     seen = {item["document_id"] for item in results}
-    if embedding_runtime_status()["available"]:
+    if (
+        (allow_embedding_cold_start or _EMBEDDING_MODEL_INSTANCE is not None)
+        and embedding_runtime_status()["available"]
+    ):
         try:
             import numpy as np
             semantic_rows = db.execute(
@@ -1218,7 +1417,9 @@ def context_search(
 ) -> dict[str, Any]:
     scope, primary_project_ids = resolve_scope(db, project_ref)
     primary_ref = f"collection:{scope['slug']}" if scope["type"] == "collection" else scope["slug"]
-    primary_results = hybrid_scope_search(db, primary_ref, query, project_limit)
+    primary_results = hybrid_scope_search(
+        db, primary_ref, query, project_limit, allow_embedding_cold_start=False
+    )
     for item in primary_results:
         item["retrieval_reason"] = (
             "explicit_collection" if scope["type"] == "collection" else "current_project"
@@ -1226,7 +1427,11 @@ def context_search(
     global_results: list[dict[str, Any]] = []
     if include_global and scope["type"] != "global":
         global_results = hybrid_scope_search(
-            db, f"collection:{GLOBAL_COLLECTION_SLUG}", query, global_limit
+            db,
+            f"collection:{GLOBAL_COLLECTION_SLUG}",
+            query,
+            global_limit,
+            allow_embedding_cold_start=False,
         ) if global_limit > 0 else []
         for item in global_results:
             item["retrieval_reason"] = "global_relevance"
@@ -1235,7 +1440,11 @@ def context_search(
         _, global_project_ids = resolve_scope(db, f"collection:{GLOBAL_COLLECTION_SLUG}")
         candidate_project_ids.extend(global_project_ids)
     candidate_memories = candidate_memory_search(
-        db, list(dict.fromkeys(candidate_project_ids)), query, 3
+        db,
+        list(dict.fromkeys(candidate_project_ids)),
+        query,
+        3,
+        allow_embedding_cold_start=False,
     )
     seen: set[tuple[str, str]] = set()
     results: list[dict[str, Any]] = []
@@ -1254,6 +1463,9 @@ def context_search(
             "global": len(global_results),
             "candidates": len(candidate_memories),
         },
+        "semantic_mode": (
+            "warm_hybrid" if _EMBEDDING_MODEL_INSTANCE is not None else "lexical_fast_path"
+        ),
         "precedence": ["explicit_user_instruction", "project", "collection", "global", "untrusted_web"],
         "completion_actions": {
             "memory_review_required": True,
@@ -1269,6 +1481,39 @@ def context_search(
             "以下候选来自旧会话，尚未确认，不能作为当前事实或约束；仅在相关时向用户核实后激活。"
         ),
         "candidate_memories": candidate_memories,
+    }
+
+
+def unresolved_context_response(
+    error: ProjectResolutionError,
+    query: str,
+    include_global: bool,
+) -> dict[str, Any]:
+    """Return a safe non-search result so ambiguity never becomes cross-project retrieval."""
+    return {
+        "scope": None,
+        "query": query,
+        "include_global": include_global,
+        "result_counts": {"primary": 0, "global": 0, "candidates": 0},
+        "resolution_required": {
+            "code": error.code,
+            "message": str(error),
+            "candidates": list(error.candidates),
+            "instruction": "请根据当前工作区选择唯一项目；在确认前不要搜索其他项目。",
+        },
+        "precedence": [
+            "explicit_user_instruction", "project", "collection", "global", "untrusted_web"
+        ],
+        "completion_actions": {
+            "memory_review_required": True,
+            "instruction": (
+                "最终答复前主动复核本轮用户原话；仅保存用户明确表达的长期有效信息。"
+            ),
+            "scope_rule": "项目未解析时禁止写入长期记忆。",
+        },
+        "results": [],
+        "candidate_notice": "项目尚未解析，因此未读取任何候选记忆。",
+        "candidate_memories": [],
     }
 
 
@@ -2038,34 +2283,49 @@ def web_search_result_quality(
     return max(1, score), sorted(matched), host, source_tier
 
 
-def web_search(db: sqlite3.Connection, query: str, limit: int = 10) -> dict[str, Any]:
-    query = query.strip()
-    if not query:
-        raise ValueError("搜索词为空")
-    endpoint = os.environ.get("KHUB_SEARXNG_URL", "http://127.0.0.1:8888/search")
-    engines = os.environ.get(
-        "KHUB_SEARXNG_ENGINES",
-        "duckduckgo,yandex,stract,google",
-    ).strip()
+def simplify_web_search_query(query: str) -> str:
+    """Conservatively remove search filler while preserving site restrictions."""
+    cleaned = re.sub(r"[\"'“”‘’]+", " ", query)
+    filler = {
+        "请", "请问", "帮我", "请搜索", "请查找", "搜索", "查找", "查询",
+        "资料", "相关资料", "官方资料", "最新资料", "官方", "最新",
+        "please", "search", "find", "official", "latest",
+    }
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in cleaned.split():
+        normalized = token.strip(" ,，。;；:：()[]{}")
+        if not normalized or normalized.lower() in filler:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(normalized)
+    return " ".join(tokens) or query
+
+
+def request_searxng_search(
+    endpoint: str, query: str, engines: str | None, timeout: int = 10
+) -> tuple[dict[str, Any], str]:
     parameters = {"q": query, "format": "json", "safesearch": "1"}
     if engines:
         parameters["engines"] = engines
     url = endpoint + "?" + urllib.parse.urlencode(parameters)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "KnowledgeHub/1.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read(4_000_000))
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        audit(db, "web.search.failed", None, {
-            "query": query, "reason": "request_failed", "engines": engines,
-        })
-        db.commit()
-        raise ValueError("本地 SearXNG 尚未就绪或搜索失败") from exc
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "KnowledgeHub/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read(4_000_000)), url
 
-    raw_items = payload.get("results", [])
+
+def rank_web_search_results(
+    query: str, raw_items: list[dict[str, Any]], limit: int
+) -> tuple[list[dict[str, Any]], set[str], int]:
     ranked_results: list[tuple[int, int, dict[str, Any], str]] = []
     rejected_domains: set[str] = set()
-    for index, item in enumerate(raw_items[:100]):
+    for index, item in enumerate(raw_items[:300]):
         item_url = item.get("url")
         if not item_url:
             continue
@@ -2112,21 +2372,91 @@ def web_search(db: sqlite3.Connection, query: str, limit: int = 10) -> dict[str,
         results.append(result)
         if len(results) >= requested_limit:
             break
+    return results, rejected_domains, len(ranked_results)
 
-    unresponsive = [
-        {"engine": str(item[0]), "reason": str(item[1]) if len(item) > 1 else "unknown"}
-        for item in payload.get("unresponsive_engines", [])
-        if item
-    ]
+
+def web_search(db: sqlite3.Connection, query: str, limit: int = 10) -> dict[str, Any]:
+    query = query.strip()
+    if not query:
+        raise ValueError("搜索词为空")
+    endpoint = os.environ.get("KHUB_SEARXNG_URL", "http://127.0.0.1:8888/search")
+    engines = os.environ.get(
+        "KHUB_SEARXNG_ENGINES",
+        "duckduckgo,yandex,stract,google",
+    ).strip()
+    simplified_query = simplify_web_search_query(query)
+    attempt_specs: list[tuple[str, str, str | None]] = [("configured", query, engines or None)]
+    if engines:
+        attempt_specs.append(("default_engines", query, None))
+    if simplified_query != query:
+        attempt_specs.append(("simplified_query", simplified_query, None))
+
+    raw_items: list[dict[str, Any]] = []
+    raw_urls: set[str] = set()
+    unresponsive: list[dict[str, str]] = []
+    attempts: list[dict[str, Any]] = []
+    request_errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    rejected_domains: set[str] = set()
+    accepted_before_limit = 0
+    for mode, attempt_query, attempt_engines in attempt_specs:
+        try:
+            payload, _ = request_searxng_search(endpoint, attempt_query, attempt_engines)
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            request_errors.append(f"{mode}:{type(exc).__name__}")
+            attempts.append({
+                "mode": mode, "query": attempt_query,
+                "engines": attempt_engines or "searxng-default",
+                "status": "request_failed",
+            })
+            continue
+        attempt_raw = payload.get("results", [])
+        for item in attempt_raw[:100]:
+            canonical_url = str(item.get("url") or "").split("#", 1)[0]
+            if not canonical_url or canonical_url in raw_urls:
+                continue
+            raw_urls.add(canonical_url)
+            raw_items.append(item)
+        for item in payload.get("unresponsive_engines", []):
+            if not item:
+                continue
+            diagnostic = {
+                "engine": str(item[0]),
+                "reason": str(item[1]) if len(item) > 1 else "unknown",
+            }
+            if diagnostic not in unresponsive:
+                unresponsive.append(diagnostic)
+        results, rejected_domains, accepted_before_limit = rank_web_search_results(
+            query, raw_items, limit
+        )
+        attempts.append({
+            "mode": mode, "query": attempt_query,
+            "engines": attempt_engines or "searxng-default",
+            "status": "accepted" if results else "no_acceptable_results",
+            "raw_result_count": len(attempt_raw),
+        })
+        if results:
+            break
+
+    if not attempts or all(item["status"] == "request_failed" for item in attempts):
+        audit(db, "web.search.failed", None, {
+            "query": query, "reason": "request_failed", "engines": engines,
+            "attempts": attempts, "request_errors": request_errors,
+        })
+        db.commit()
+        raise ValueError("本地 SearXNG 尚未就绪或搜索失败")
+
     quality = {
         "raw_result_count": len(raw_items),
         "accepted_result_count": len(results),
-        "rejected_result_count": max(0, len(raw_items) - len(ranked_results)),
+        "rejected_result_count": max(0, len(raw_items) - accepted_before_limit),
         "returned_source_tiers": {
             tier: sum(1 for result in results if result["source_tier"] == tier)
             for tier in sorted({result["source_tier"] for result in results})
         },
         "unresponsive_engines": unresponsive,
+        "attempts": attempts,
+        "fallback_used": bool(results and len(attempts) > 1),
     }
     if not results:
         reason = "irrelevant_results" if raw_items else "no_results"
@@ -2191,9 +2521,17 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
         current_status = status(db)
         return {key: current_status[key] for key in ("projects", "global_scopes", "collection_memory_scopes", "collections")}
     if name == "knowledge_search":
-        return search(db, args["project"], args["query"], int(args.get("limit", 10)))
+        project_ref = resolve_project_reference(db, args.get("project"))
+        return search(db, project_ref, args["query"], int(args.get("limit", 10)))
     if name == "knowledge_context":
-        project_ref = resolve_project_reference(db, args.get("project"), args.get("workspace_path"))
+        try:
+            project_ref = resolve_project_reference(
+                db, args.get("project"), args.get("workspace_path")
+            )
+        except ProjectResolutionError as exc:
+            return unresolved_context_response(
+                exc, str(args.get("query", "")), bool(args.get("include_global", True))
+            )
         return context_search(
             db, project_ref, args["query"], int(args.get("limit", 8)),
             int(args.get("global_limit", 4)), bool(args.get("include_global", True)),
@@ -2236,6 +2574,27 @@ def mcp_call(db: sqlite3.Connection, name: str, args: dict[str, Any]) -> Any:
     raise ValueError(f"未知工具：{name}")
 
 
+def mcp_error_code(error: Exception) -> str:
+    if isinstance(error, ProjectResolutionError):
+        return error.code
+    message = str(error)
+    if "搜索引擎当前不可用" in message:
+        return "web_engines_unavailable"
+    if "未找到与查询相关" in message:
+        return "web_no_results"
+    if "搜索结果与查询明显无关" in message:
+        return "web_irrelevant_results"
+    if "SearXNG" in message:
+        return "web_service_unavailable"
+    if "未知项目" in message or "未知项目集合" in message:
+        return "unknown_scope"
+    if isinstance(error, KeyError):
+        return "missing_argument"
+    if isinstance(error, ValueError):
+        return "validation_rejected"
+    return "internal_error"
+
+
 def mcp_server(db_path: Path) -> None:
     # MCP stdio is UTF-8 JSON on every supported platform.  Windows can inherit
     # a legacy console code page even when stdout is redirected by a client.
@@ -2276,7 +2635,7 @@ def mcp_server(db_path: Path) -> None:
                 started = time.monotonic()
                 try:
                     value = mcp_call(db, tool_name, params.get("arguments", {}))
-                except Exception:
+                except Exception as exc:
                     audit(
                         db,
                         "mcp.tool_call",
@@ -2285,6 +2644,12 @@ def mcp_server(db_path: Path) -> None:
                             **client_info,
                             "tool": tool_name,
                             "ok": False,
+                            "server_pid": os.getpid(),
+                            "error_code": mcp_error_code(exc),
+                            "error_class": type(exc).__name__,
+                            "candidate_count": len(exc.candidates)
+                            if isinstance(exc, ProjectResolutionError)
+                            else 0,
                             "duration_ms": round((time.monotonic() - started) * 1000),
                         },
                     )
@@ -2298,10 +2663,21 @@ def mcp_server(db_path: Path) -> None:
                         **client_info,
                         "tool": tool_name,
                         "ok": True,
+                        "server_pid": os.getpid(),
+                        "outcome": "resolution_required"
+                        if isinstance(value, dict) and value.get("resolution_required")
+                        else "completed",
                         "duration_ms": round((time.monotonic() - started) * 1000),
                     },
                 )
                 db.commit()
+                if (
+                    tool_name == "knowledge_context"
+                    and isinstance(value, dict)
+                    and not value.get("resolution_required")
+                    and db.execute("SELECT 1 FROM memory_embeddings LIMIT 1").fetchone()
+                ):
+                    warm_embedding_model_async()
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}], "isError": False}
             elif method and method.startswith("notifications/"):
                 continue
@@ -2390,13 +2766,19 @@ def main() -> int:
     elif args.command == "project-list":
         json_print(list_projects(db))
     elif args.command == "ingest":
-        json_print(asdict(ingest_project(db, args.project)))
+        json_print(asdict(ingest_project(db, resolve_project_reference(db, args.project))))
     elif args.command == "search":
-        json_print(search(db, args.project, args.query, args.limit))
+        json_print(search(db, resolve_project_reference(db, args.project), args.query, args.limit))
     elif args.command == "context":
-        json_print(context_search(db, args.project, args.query, args.limit, args.global_limit, not args.no_global))
+        json_print(context_search(
+            db, resolve_project_reference(db, args.project), args.query,
+            args.limit, args.global_limit, not args.no_global,
+        ))
     elif args.command == "remember":
-        json_print(remember(db, args.project, args.title, args.content, args.kind))
+        json_print(remember(
+            db, resolve_project_reference(db, args.project),
+            args.title, args.content, args.kind,
+        ))
     elif args.command == "memory-list":
         json_print(list_memories(db, args.scope, args.kind, args.status, args.limit))
     elif args.command == "memory-update":

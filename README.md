@@ -79,6 +79,14 @@ results, transient debugging, and inferred information are not stored as memory.
 Generated `test.log` files are excluded from indexing, and empty global or memory
 scopes are skipped before full-text or embedding work begins.
 
+Project hints may be a slug, display name, workspace path, or a longer human label
+containing a unique project name. Ambiguous or unknown hints fail closed and never
+fall through to another project. Context lookup uses a project-partitioned full-text
+index and returns its lexical fast path immediately while the optional embedding
+model warms in the background. Web search retries through SearXNG's default engines
+and a conservatively simplified query when configured engines return no usable
+results.
+
 ## Commands
 
 Windows PowerShell:
@@ -111,7 +119,7 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
 
 ## Upgrade
 
-Extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained.
+Extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained. Upgrading a large existing database to the project-partitioned search index can take several minutes; the installer completes that one-time migration before it asks you to restart clients.
 
 ## Uninstall
 
