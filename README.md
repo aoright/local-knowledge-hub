@@ -28,7 +28,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.2.1.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.2.2.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges.
@@ -37,7 +37,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.2.1.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.2.2.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -71,6 +71,13 @@ Core-only installation without Onyx or SearXNG:
 The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
+
+Version 1.2.2 validates automatic memory from the user's original evidence only.
+Questions, transient UI feedback, and implementation requests are rejected, and an
+assistant-generated title cannot promote project memory into a global scope. Existing
+noisy automatic memories can be reviewed and reversibly demoted to candidates. WAL
+checkpoints now run with short busy timeouts, while backup pruning remains a dry run
+until an operator explicitly applies the exact target list.
 
 Version 1.2.1 also reviews the user's own messages at task completion for explicit,
 durable project decisions, facts, constraints, and runbooks. Eligible items are

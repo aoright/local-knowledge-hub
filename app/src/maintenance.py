@@ -45,6 +45,146 @@ CRITICAL_TABLES = (
 )
 
 
+def checkpoint_database(
+    db_path: Path | None = None,
+    truncate: bool = False,
+    busy_timeout_ms: int = 2_000,
+) -> dict[str, Any]:
+    """Checkpoint WAL without waiting indefinitely for active MCP readers."""
+    path = (db_path or kh.DEFAULT_DB).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"数据库不存在：{path}")
+    wal_path = Path(f"{path}-wal")
+    before = wal_path.stat().st_size if wal_path.exists() else 0
+    db = sqlite3.connect(path, timeout=max(0.1, busy_timeout_ms / 1_000))
+    try:
+        db.execute(f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}")
+        mode = "TRUNCATE" if truncate else "PASSIVE"
+        busy, log_frames, checkpointed_frames = db.execute(
+            f"PRAGMA wal_checkpoint({mode})"
+        ).fetchone()
+    finally:
+        db.close()
+    after = wal_path.stat().st_size if wal_path.exists() else 0
+    return {
+        "database": str(path),
+        "mode": mode.lower(),
+        "busy": int(busy),
+        "log_frames": int(log_frames),
+        "checkpointed_frames": int(checkpointed_frames),
+        "wal_bytes_before": before,
+        "wal_bytes_after": after,
+        "truncated": bool(truncate and not busy and after < before),
+    }
+
+
+def prune_backups(
+    full_retain: int = 3,
+    critical_retain: int = 14,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Preview or apply exact, mode-aware backup retention targets."""
+    if full_retain < 1 or critical_retain < 1:
+        raise ValueError("每种备份至少保留 1 份")
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    groups = {
+        "full": (
+            sorted(BACKUP_DIR.glob("knowledge-hub-[0-9]*.sqlite3.gz"), reverse=True),
+            full_retain,
+        ),
+        "critical": (
+            sorted(BACKUP_DIR.glob("knowledge-hub-critical-*.sqlite3.gz"), reverse=True),
+            critical_retain,
+        ),
+    }
+    remove: list[Path] = []
+    retained: dict[str, int] = {}
+    for name, (files, keep) in groups.items():
+        retained[name] = min(len(files), keep)
+        remove.extend(files[keep:])
+    reclaimable = sum(
+        path.stat().st_size
+        + (
+            path.with_suffix(path.suffix + ".sha256").stat().st_size
+            if path.with_suffix(path.suffix + ".sha256").exists()
+            else 0
+        )
+        for path in remove
+    )
+    if apply:
+        for path in remove:
+            path.unlink(missing_ok=True)
+            path.with_suffix(path.suffix + ".sha256").unlink(missing_ok=True)
+    return {
+        "applied": apply,
+        "full_retain": full_retain,
+        "critical_retain": critical_retain,
+        "retained": retained,
+        "remove_count": len(remove),
+        "reclaimable_bytes": reclaimable,
+        "targets": [str(path) for path in remove],
+    }
+
+
+def review_automatic_memories(
+    apply: bool = False,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Preview or quarantine noisy automatic memories without deleting them."""
+    db = kh.connect(db_path or kh.DEFAULT_DB)
+    kh.initialize(db)
+    rows = db.execute(
+        "SELECT mr.document_id,mr.scope_type,mr.kind,mr.evidence,d.title,p.slug "
+        "FROM memory_records mr JOIN documents d ON d.id=mr.document_id "
+        "JOIN projects p ON p.id=d.project_id "
+        "WHERE mr.status='active' AND mr.capture_mode='automatic' "
+        "ORDER BY mr.created_at"
+    ).fetchall()
+    targets: list[dict[str, Any]] = []
+    for row in rows:
+        issues = kh.automatic_memory_evidence_issues(
+            row["evidence"] or "", row["kind"], row["scope_type"]
+        )
+        if issues:
+            targets.append({
+                "document_id": row["document_id"],
+                "scope": row["slug"],
+                "title": row["title"],
+                "issues": issues,
+            })
+    if apply:
+        now = kh.utcnow()
+        for target in targets:
+            memory = kh.get_memory(db, target["document_id"])
+            metadata = dict(memory["metadata"])
+            metadata["status"] = "candidate"
+            reason = "自动记忆质量复核：" + "、".join(target["issues"])
+            kh.append_memory_history(
+                db, memory["id"], "quality_quarantined", memory["title"],
+                memory["content"], metadata, reason, memory.get("evidence"), "system",
+            )
+            db.execute(
+                "UPDATE memory_records SET status='candidate',updated_at=? WHERE document_id=?",
+                (now, memory["id"]),
+            )
+            db.execute(
+                "UPDATE documents SET metadata_json=?,indexed_at=? WHERE id=?",
+                (json.dumps(metadata, ensure_ascii=False), now, memory["id"]),
+            )
+            kh.audit(
+                db, "memory.quality_quarantined", memory["project_id"],
+                {"document_id": memory["id"], "issues": target["issues"]},
+            )
+        db.commit()
+    db.close()
+    return {
+        "applied": apply,
+        "review_count": len(targets),
+        "action": "demote_to_candidate",
+        "targets": targets,
+    }
+
+
 def lock():
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.parent.chmod(0o700)
@@ -125,6 +265,7 @@ def backup(retain: int = 14, mode: str = "full") -> dict:
     with tempfile.TemporaryDirectory(dir=BACKUP_DIR) as temp_dir:
         snapshot = Path(temp_dir) / "snapshot.sqlite3"
         source_db = kh.connect()
+        source_path_text = source_db.execute("PRAGMA database_list").fetchone()[2]
         target_db = sqlite3.connect(snapshot)
         target_db.row_factory = sqlite3.Row
         if mode == "critical":
@@ -157,6 +298,11 @@ def backup(retain: int = 14, mode: str = "full") -> dict:
     for old in backups[max(1, retain):]:
         old.unlink(missing_ok=True)
         old.with_suffix(old.suffix + ".sha256").unlink(missing_ok=True)
+    checkpoint = (
+        checkpoint_database(Path(source_path_text), truncate=True)
+        if source_path_text
+        else None
+    )
     return {
         "backup": str(destination),
         "mode": mode,
@@ -164,6 +310,7 @@ def backup(retain: int = 14, mode: str = "full") -> dict:
         "integrity_check": check,
         "retained": min(len(backups), max(1, retain)),
         "copied": copied,
+        "checkpoint": checkpoint,
     }
 
 
@@ -328,6 +475,7 @@ def git_project_fingerprint(project: dict) -> str | None:
 def ingest_all(force: bool = False) -> dict:
     db = kh.connect()
     kh.initialize(db)
+    source_path_text = db.execute("PRAGMA database_list").fetchone()[2]
     state = load_index_state()
     results = []
     failures = []
@@ -363,6 +511,11 @@ def ingest_all(force: bool = False) -> dict:
     memory = kh.maintain_memories(db)
     embeddings = kh.backfill_memory_embeddings(db)
     db.close()
+    checkpoint = (
+        checkpoint_database(Path(source_path_text), truncate=False)
+        if source_path_text
+        else None
+    )
     return {
         "projects": len(results),
         "fingerprint_skipped": len(fingerprint_skipped),
@@ -373,6 +526,7 @@ def ingest_all(force: bool = False) -> dict:
         "unchanged": sum(item["unchanged"] for item in results),
         "memory": memory,
         "embeddings": embeddings,
+        "checkpoint": checkpoint,
     }
 
 
@@ -401,6 +555,15 @@ def main() -> int:
     verify.add_argument("--target", type=Path)
     ingest_parser = sub.add_parser("ingest-all")
     ingest_parser.add_argument("--force", action="store_true")
+    checkpoint_parser = sub.add_parser("checkpoint")
+    checkpoint_parser.add_argument("--truncate", action="store_true")
+    checkpoint_parser.add_argument("--busy-timeout-ms", type=int, default=2_000)
+    prune = sub.add_parser("prune-backups")
+    prune.add_argument("--full-retain", type=int, default=3)
+    prune.add_argument("--critical-retain", type=int, default=14)
+    prune.add_argument("--apply", action="store_true")
+    memory_review = sub.add_parser("memory-quality-review")
+    memory_review.add_argument("--apply", action="store_true")
     sub.add_parser("health")
     sub.add_parser("memory-maintain")
     sub.add_parser("memory-embed")
@@ -412,6 +575,16 @@ def main() -> int:
         value = verify_backup(args.source, args.target)
     elif args.command == "ingest-all":
         value = ingest_all(args.force)
+    elif args.command == "checkpoint":
+        value = checkpoint_database(
+            truncate=args.truncate, busy_timeout_ms=args.busy_timeout_ms
+        )
+    elif args.command == "prune-backups":
+        value = prune_backups(
+            args.full_retain, args.critical_retain, args.apply
+        )
+    elif args.command == "memory-quality-review":
+        value = review_automatic_memories(args.apply)
     elif args.command == "memory-maintain":
         db = kh.connect()
         kh.initialize(db)

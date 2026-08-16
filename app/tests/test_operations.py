@@ -285,6 +285,84 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(verified["documents"], 1)
             self.assertFalse(any(backup_dir.glob("tmp*")))
 
+    def test_checkpoint_database_reports_safe_wal_result(self):
+        with tempfile.TemporaryDirectory() as value:
+            db_path = Path(value) / "knowledge.sqlite3"
+            db = maintenance.kh.connect(db_path)
+            maintenance.kh.initialize(db)
+            db.execute(
+                "INSERT INTO audit_log(event_at,action,project_id,details_json) "
+                "VALUES('2026-01-01T00:00:00+00:00','test',NULL,'{}')"
+            )
+            db.commit()
+            db.close()
+            result = maintenance.checkpoint_database(db_path, truncate=True)
+
+        self.assertEqual(result["mode"], "truncate")
+        self.assertEqual(result["busy"], 0)
+        self.assertLessEqual(result["wal_bytes_after"], result["wal_bytes_before"])
+
+    def test_backup_pruning_is_dry_run_until_explicitly_applied(self):
+        with tempfile.TemporaryDirectory() as value:
+            backup_dir = Path(value)
+            for index in range(5):
+                full = backup_dir / f"knowledge-hub-2026010{index}T000000Z.sqlite3.gz"
+                full.write_bytes(b"full" * (index + 1))
+                full.with_suffix(full.suffix + ".sha256").write_text("checksum\n")
+            for index in range(4):
+                critical = backup_dir / f"knowledge-hub-critical-2026010{index}T000000Z.sqlite3.gz"
+                critical.write_bytes(b"critical" * (index + 1))
+
+            with mock.patch.object(maintenance, "BACKUP_DIR", backup_dir):
+                preview = maintenance.prune_backups(2, 2, apply=False)
+                self.assertEqual(len(list(backup_dir.glob("*.sqlite3.gz"))), 9)
+                applied = maintenance.prune_backups(2, 2, apply=True)
+
+            self.assertFalse(preview["applied"])
+            self.assertEqual(preview["remove_count"], 5)
+            self.assertGreater(preview["reclaimable_bytes"], 0)
+            self.assertTrue(applied["applied"])
+            self.assertEqual(len(list(backup_dir.glob("*.sqlite3.gz"))), 4)
+
+    def test_memory_quality_review_quarantines_without_deleting(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            project = root / "project"
+            project.mkdir()
+            db_path = root / "knowledge.sqlite3"
+            db = maintenance.kh.connect(db_path)
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "alpha", "Alpha", str(project))
+            good = maintenance.kh.remember(
+                db, "alpha", "Durable rule", "Production releases require regression tests",
+                "constraint", {"capture_mode": "automatic", "evidence": "以后生产发布必须先通过回归测试"},
+            )
+            noisy = maintenance.kh.remember(
+                db, "alpha", "Button feedback", "Move the button to the left",
+                "decision", {"capture_mode": "automatic", "evidence": "这个按钮怎么还在这里？"},
+            )
+            db.close()
+
+            preview = maintenance.review_automatic_memories(False, db_path)
+            applied = maintenance.review_automatic_memories(True, db_path)
+            check = maintenance.kh.connect(db_path)
+            good_status = maintenance.kh.get_memory(check, good["document_id"])["status"]
+            noisy_memory = maintenance.kh.get_memory(check, noisy["document_id"])
+            history_events = [
+                row[0] for row in check.execute(
+                    "SELECT event FROM memory_history WHERE document_id=? ORDER BY version_no",
+                    (noisy["document_id"],),
+                )
+            ]
+            check.close()
+
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["review_count"], 1)
+        self.assertTrue(applied["applied"])
+        self.assertEqual(good_status, "active")
+        self.assertEqual(noisy_memory["status"], "candidate")
+        self.assertIn("quality_quarantined", history_events)
+
 
 if __name__ == "__main__":
     unittest.main()

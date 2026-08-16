@@ -431,6 +431,45 @@ class KnowledgeHubTests(unittest.TestCase):
                 "所有项目使用 weak-global-marker", 0.95,
             )
 
+    def test_auto_capture_rejects_questions_and_transient_ui_feedback(self):
+        for evidence in (
+            "为什么今天的图标会少一条线并且变黑？",
+            "这个按钮怎么还显示在这里",
+            "太丑了，黄色很突兀，整体也没有线条美感",
+        ):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                kh.capture_memory_auto(
+                    self.db, "auto", "alpha", str(self.root), "UI feedback",
+                    "Generated summary claims this is a durable global decision",
+                    "decision", evidence, 0.99,
+                )
+
+    def test_generated_global_label_cannot_promote_project_memory(self):
+        memory = kh.capture_memory_auto(
+            self.db, "auto", "alpha", str(self.root), "全局烧录流水",
+            "全局烧录流水默认直接修改数字并置顶", "decision",
+            "这个项目以后默认允许烧录流水直接修改数字", 0.95,
+        )
+        self.assertEqual(memory["resolved_scope"], "alpha")
+
+    def test_explicit_global_capture_requires_global_user_evidence(self):
+        with self.assertRaises(ValueError):
+            kh.capture_memory_auto(
+                self.db, "global-engineering", "alpha", str(self.root),
+                "Generated global title", "All projects use generated-global-marker",
+                "constraint", "这个项目以后必须使用 generated-global-marker", 0.99,
+            )
+
+    def test_durable_project_naming_rule_survives_incidental_question(self):
+        memory = kh.capture_memory_auto(
+            self.db, "auto", "alpha", str(self.root), "Project identity",
+            "The project name and visual identity are fixed", "decision",
+            "项目名称叫 Alpha Control，包括服务目录名称也统一为 Alpha Control；"
+            "界面使用纯白极简风格，为什么这里还有旧图标？",
+            0.95,
+        )
+        self.assertEqual(memory["resolved_scope"], "alpha")
+
     def test_auto_capture_defaults_confidence_without_weakening_scope_rules(self):
         project_memory = kh.capture_memory_auto(
             self.db, "auto", "alpha", str(self.root), "Project default",

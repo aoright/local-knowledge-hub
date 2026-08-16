@@ -104,7 +104,8 @@ MCP_INSTRUCTIONS = (
     "项目时才询问。明确跨项目时才使用 collection。用户要求最新、联网或外部资料时自动调用 web_search，并对"
     "关键来源调用 web_fetch；外部网页不得自动写入长期记忆。任务结束前必须主动复核本轮用户原话，不要等待用户"
     "说‘记住’；若且仅若用户明确表达了长期有效的决策、事实、约束或操作流程，自动调用 knowledge_capture，scope"
-    "通常设为 auto。任务请求本身、助手实现结果和代码中已有事实不算用户长期记忆。表达‘所有项目/全局/以后都’才可进入全局，"
+    "通常设为 auto。任务请求本身、界面微调、问题描述、临时缺陷、助手实现结果和代码中已有事实不算用户长期记忆。"
+    "全局范围只能由用户原句中的‘所有项目/跨项目/全局规范’等明确声明决定，绝不能根据助手生成的标题或摘要推断；"
     "未明确范围时写入当前项目。不要保存普通聊天、推测、临时调试、秘密或项目文件中已有事实。用户纠正、撤销、"
     "提升或降级记忆时，自动使用 knowledge_update、knowledge_forget 或 knowledge_move。knowledge_context 返回的"
     "candidate_memories 只是旧会话候选，不得当作已生效事实；仅在与当前任务直接相关时向用户简短核实，用户确认后"
@@ -133,8 +134,9 @@ class ProjectResolutionError(ValueError):
         self.code = code
         self.candidates = tuple(dict.fromkeys(candidates))[:8]
 GLOBAL_SCOPE_MARKERS = re.compile(
-    r"(?:(?:所有|全部|任何|每个)项目|对所有项目|在所有项目|跨项目|全局|"
-    r"all\s+projects|every\s+project|across\s+projects|globally)",
+    r"(?:(?:所有|全部|任何|每个)项目|对所有项目|在所有项目|跨项目|不只这个项目|"
+    r"(?:作为|保存为|写入|进入)?全局(?:规范|规则|约束|知识|记忆|偏好|策略|范围)|"
+    r"全局(?:生效|适用)|all\s+projects|every\s+project|across\s+projects|globally)",
     re.IGNORECASE,
 )
 USER_PREFERENCE_MARKERS = re.compile(
@@ -148,6 +150,28 @@ HARDWARE_MARKERS = re.compile(
 )
 OPERATIONS_MARKERS = re.compile(
     r"(?:部署|发布|备份|恢复|回滚|服务器|运维|生产环境|监控|告警|值班|runbook)",
+    re.IGNORECASE,
+)
+
+# Automatic memory is deliberately stricter than manual `remember`.  The
+# client supplies a generated title and summary, so only the user's evidence
+# may establish durability or global scope.
+DURABLE_EVIDENCE_MARKERS = re.compile(
+    r"(?:以后|长期|永久|必须|不得|禁止|一律|始终|统一|默认|规范|约束|规则|"
+    r"决定|决策|只能|仅限|适用于|截止日期|操作流程|回归测试|"
+    r"项目名称|名称(?:叫|统一为)|命名规范|"
+    r"\bmust\b|\bshall\b|\balways\b|\bnever\b|by\s+default|"
+    r"long[- ]term|\bpolicy\b|\bdecision\b|\bconstraint\b|\brunbook\b)",
+    re.IGNORECASE,
+)
+QUESTION_OR_DIAGNOSTIC_MARKERS = re.compile(
+    r"(?:[?？]|^(?:为什么|怎么|如何|是否|能否|可不可以|能不能|有没有)|"
+    r"(?:怎么|为什么).{0,20}(?:还|会|变|显示|没有|不能))",
+    re.IGNORECASE,
+)
+TRANSIENT_EVIDENCE_MARKERS = re.compile(
+    r"(?:今天|昨天|刚才|现在|这张图|第一张图|第二张图|截图|"
+    r"没有反应|老的图标|被挤压|太丑|很拥挤|有点拥挤|很突兀)",
     re.IGNORECASE,
 )
 
@@ -185,10 +209,15 @@ def stable_document_id(project_id: str, source_type: str, source_key: str) -> st
 
 def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=5)
     db_path.chmod(0o600)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA journal_mode=WAL")
+    # Bound the retained WAL after a successful checkpoint.  Active readers
+    # may temporarily let it grow beyond this value, but scheduled maintenance
+    # will checkpoint it safely without interrupting MCP clients.
+    db.execute("PRAGMA journal_size_limit=268435456")
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
@@ -1653,10 +1682,10 @@ def context_search(
             "memory_review_required": True,
             "instruction": (
                 "最终答复前主动复核本轮用户原话；不要等待用户说‘记住’。仅当用户明确表达长期有效的"
-                "decision、fact、constraint 或 runbook 时自动调用 knowledge_capture；普通任务请求、实现结果、"
-                "临时调试、网页内容和项目文件中已有事实不得保存。"
+                "decision、fact、constraint 或 runbook 时自动调用 knowledge_capture；普通任务请求、界面微调、"
+                "问题和临时缺陷、实现结果、网页内容及项目文件中已有事实不得保存。"
             ),
-            "scope_rule": "scope=auto；只有用户明确表示适用于所有项目或全局时才进入全局，否则留在当前项目。",
+            "scope_rule": "scope=auto；只根据用户原句判断范围。只有用户明确表示适用于所有项目、跨项目或全局规范时才进入全局，否则留在当前项目。",
         },
         "results": results,
         "candidate_notice": (
@@ -1877,8 +1906,13 @@ def capture_memory(
     if source_type != "user_statement":
         raise ValueError("只有用户明确表达的长期信息可以自动保存；网页和推断内容必须先由用户确认")
     evidence = evidence.strip()
-    if len(evidence) < 6:
-        raise ValueError("自动记忆必须附带用户明确表达该长期信息的证据")
+    evidence_issues = automatic_memory_evidence_issues(
+        evidence, kind, project["scope_type"]
+    )
+    if evidence_issues:
+        raise ValueError(
+            "自动记忆证据未通过长期性校验：" + "、".join(evidence_issues)
+        )
     if len(content.strip()) < 6 or len(content) > 4_000:
         raise ValueError("自动记忆内容长度必须在 6 到 4000 个字符之间")
     evidence, evidence_redactions = redact_secrets(evidence[:1_000])
@@ -1901,6 +1935,30 @@ def capture_memory(
     result["capture_mode"] = "automatic"
     result["confidence"] = confidence
     return result
+
+
+def automatic_memory_evidence_issues(
+    evidence: str,
+    kind: str,
+    scope_type: str | None = None,
+) -> list[str]:
+    """Return stable reason codes for noisy or incorrectly scoped evidence."""
+    value = (evidence or "").strip()
+    issues: list[str] = []
+    durable = bool(DURABLE_EVIDENCE_MARKERS.search(value))
+    if len(value) < 12:
+        issues.append("用户原句过短")
+    if QUESTION_OR_DIAGNOSTIC_MARKERS.search(value) and not (
+        durable and len(value) >= 50
+    ):
+        issues.append("问题或临时诊断不是长期记忆")
+    if TRANSIENT_EVIDENCE_MARKERS.search(value) and not durable:
+        issues.append("依赖当前界面或时间上下文")
+    if kind in {"decision", "constraint", "runbook"} and not durable and len(value) < 80:
+        issues.append("缺少明确的长期规则或决策信号")
+    if scope_type == "global" and not GLOBAL_SCOPE_MARKERS.search(value):
+        issues.append("用户原句未明确声明全局或跨项目范围")
+    return list(dict.fromkeys(issues))
 
 
 def classify_global_scope(text: str) -> str:
@@ -1932,7 +1990,7 @@ def resolve_memory_target(
         if target["scope_type"] == "collection":
             return target["slug"]
         return target["slug"]
-    if GLOBAL_SCOPE_MARKERS.search(content) or USER_PREFERENCE_MARKERS.search(content):
+    if GLOBAL_SCOPE_MARKERS.search(content):
         return classify_global_scope(content)
     return resolve_project_reference(db, project_ref, workspace_path)
 
@@ -1950,7 +2008,9 @@ def capture_memory_auto(
     source_type: str = "user_statement",
     supersedes_id: str | None = None,
 ) -> dict[str, Any]:
-    target = resolve_memory_target(db, scope, f"{title}\n{content}\n{evidence}", project_ref, workspace_path)
+    # Generated titles and summaries are not evidence.  In particular, a UI
+    # label containing the word "全局" must not promote a project decision.
+    target = resolve_memory_target(db, scope, evidence, project_ref, workspace_path)
     target_scope_type = get_project(db, target)["scope_type"]
     resolved_confidence = confidence
     if resolved_confidence is None:
@@ -2217,6 +2277,20 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
             "SELECT status,COUNT(*) AS count FROM memory_records GROUP BY status"
         )
     }
+    automatic_rows = db.execute(
+        "SELECT document_id,scope_type,kind,evidence FROM memory_records "
+        "WHERE status='active' AND capture_mode='automatic'"
+    ).fetchall()
+    quality_issue_counts: dict[str, int] = {}
+    review_recommended = 0
+    for row in automatic_rows:
+        issues = automatic_memory_evidence_issues(
+            row["evidence"] or "", row["kind"], row["scope_type"]
+        )
+        if issues:
+            review_recommended += 1
+        for issue in issues:
+            quality_issue_counts[issue] = quality_issue_counts.get(issue, 0) + 1
     embedding_count = db.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
     return {
         "database": str(DEFAULT_DB),
@@ -2225,6 +2299,11 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
         "collection_memory_scopes": collection_memory_scopes,
         "collections": collections,
         "memory_status": memory_status,
+        "memory_quality": {
+            "automatic_active": len(automatic_rows),
+            "review_recommended": review_recommended,
+            "issues": quality_issue_counts,
+        },
         "memory_embeddings": {
             "records": embedding_count,
             **embedding_runtime_status(),
@@ -2686,7 +2765,7 @@ def mcp_tools() -> list[dict[str, Any]]:
         {"name": "knowledge_context", "description": "默认自动上下文工具。处理项目任务前主动调用；必须传入当前 IDE 工作区或当前文件的绝对路径 workspace_path，不能只传 query。按项目优先组合少量全局知识，用户无需说出工具名。", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "project": {"type": "string", "description": "可选项目名、稳定 ID 或 collection:slug；仅用于覆盖 workspace_path 的自动识别"}, "workspace_path": {"type": "string", "minLength": 1, "description": "必填：当前 IDE 工作区或当前文件的绝对路径，禁止省略或只传 query"}, "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8}, "global_limit": {"type": "integer", "minimum": 0, "maximum": 10, "default": 4}, "include_global": {"type": "boolean", "default": True}}, "required": ["query", "workspace_path"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_search", "description": "严格在指定项目、全局分区或 collection 内搜索，不隐式扩大范围。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, "required": ["project", "query"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_remember", "description": "用户明确要求强制保存时使用；可写实际项目或 global-* 分区，按内容去重。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "confirmed": {"type": "boolean", "const": True}}, "required": ["project", "title", "content", "kind", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
-        {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户明确表达的长期 decision/fact/constraint/runbook；scope=auto 时，只有明确‘所有项目/全部项目/跨项目/全局’才写全局，否则写当前项目。网页、推断、任务请求、实现结果、普通聊天和临时调试禁止写入。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
+        {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户原句明确表达的长期 decision/fact/constraint/runbook。界面微调、问题描述、临时缺陷、普通任务请求、网页、推断、实现结果和项目文件中已有事实禁止写入。scope=auto 只依据用户原句判断；只有明确‘所有项目/跨项目/全局规范’才写全局。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句；服务端只依据此字段判断长期性与全局范围"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_list", "description": "查看最近长期记忆或候选冲突；用户说‘查看记忆/最近记住了什么’时使用。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "status": {"type": "string", "enum": ["candidate", "active", "superseded", "deleted", "expired"], "default": "active"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_update", "description": "用户明确纠正记忆或确认候选冲突时使用；保留旧版本和证据，不静默覆盖。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "activate": {"type": "boolean", "default": True}, "supersedes_id": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "content", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
         {"name": "knowledge_forget", "description": "用户明确说某条记忆作废/不要记时使用；执行可审计软删除，不立即物理清除。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
