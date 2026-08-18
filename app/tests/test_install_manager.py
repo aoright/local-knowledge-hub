@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import plistlib
 import tempfile
 import tomllib
 import unittest
@@ -160,6 +161,16 @@ class InstallManagerTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertTrue((install / "bin" / "khub").stat().st_mode & 0o100)
             self.assertIn("clients", result)
+            update_agent = (
+                home / "Library" / "LaunchAgents" /
+                f"{manager.LABELS['update']}.plist"
+            )
+            self.assertTrue(update_agent.is_file())
+            payload = plistlib.loads(update_agent.read_bytes())
+            self.assertEqual(payload["ProgramArguments"][-1], "auto")
+            self.assertEqual(
+                payload["StartCalendarInterval"], {"Hour": 4, "Minute": 15}
+            )
 
     def test_windows_initialize_writes_native_wrappers_and_mcp_launch(self):
         with tempfile.TemporaryDirectory() as value:
@@ -196,6 +207,14 @@ class InstallManagerTests(unittest.TestCase):
             wrapper = (install / "bin" / "khub.cmd").read_text(encoding="utf-8")
             self.assertIn("%*", wrapper)
             self.assertIn("KHUB_DATA_DIR", wrapper)
+            self.assertTrue(
+                (install / "bin" / "knowledge-hub-update.cmd").is_file()
+            )
+            update_settings = json.loads(
+                (install / "data" / "config" / "update.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(update_settings["auto_update"])
+            self.assertFalse(update_settings["services_enabled"])
             backup_wrapper = (
                 install / "bin" / "knowledge-hub-backup.cmd"
             ).read_text(encoding="utf-8")
@@ -210,11 +229,24 @@ class InstallManagerTests(unittest.TestCase):
             create_calls = [
                 call.args[0] for call in scheduler.call_args_list if call.args[0][0] == "/Create"
             ]
-            self.assertEqual(len(create_calls), 3)
+            self.assertEqual(len(create_calls), 4)
             self.assertTrue(all("LIMITED" in arguments for arguments in create_calls))
             self.assertTrue(
                 any("knowledge-hub-services.cmd" in " ".join(arguments) for arguments in create_calls)
             )
+            self.assertTrue(
+                any("knowledge-hub-auto-update.cmd" in " ".join(arguments) for arguments in create_calls)
+            )
+
+    def test_update_preference_is_preserved_unless_explicitly_changed(self):
+        with tempfile.TemporaryDirectory() as value:
+            data = Path(value)
+            first = manager.configure_update_settings(data, True, False)
+            preserved = manager.configure_update_settings(data, False, None)
+            enabled = manager.configure_update_settings(data, False, True)
+        self.assertFalse(first["auto_update"])
+        self.assertFalse(preserved["auto_update"])
+        self.assertTrue(enabled["auto_update"])
 
 
 if __name__ == "__main__":

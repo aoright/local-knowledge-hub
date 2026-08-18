@@ -1,0 +1,89 @@
+name: Publish release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          test "v$version" = "$GITHUB_REF_NAME"
+          sha256sum --check MANIFEST.sha256
+      - name: Build portable archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          mkdir -p dist staging
+          for platform in macos windows; do
+            name="local-knowledge-hub-$platform-$version"
+            mkdir -p "staging/$name"
+            cp -a Install-Local-Knowledge-Hub.cmd LICENSE MANIFEST.sha256 README.md \
+              THIRD_PARTY_NOTICES.md VERSION app install.ps1 install.sh setup.iss \
+              uninstall.ps1 uninstall.sh "staging/$name/"
+          done
+          tar -C staging -czf "dist/local-knowledge-hub-macos-$version.tar.gz" \
+            "local-knowledge-hub-macos-$version"
+          (cd staging && zip -qr "../dist/local-knowledge-hub-windows-$version.zip" \
+            "local-knowledge-hub-windows-$version")
+          (cd dist && sha256sum local-knowledge-hub-* > portable.sha256)
+          while read -r digest name; do
+            printf '%s  %s\n' "$digest" "$name" > "dist/$name.sha256"
+          done < dist/portable.sha256
+          rm dist/portable.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-release
+          path: dist/*
+          if-no-files-found: error
+
+  windows-installer:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build installer and checksum
+        shell: powershell
+        run: |
+          $version = (Get-Content -LiteralPath .\VERSION -Raw).Trim()
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $($env:GITHUB_REF_NAME) does not match VERSION $version"
+          }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=$version" "/Odist" .\setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          $asset = "LocalKnowledgeHub-Setup-$version.exe"
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path dist $asset)).Hash.ToLowerInvariant()
+          "$digest  $asset`n" | Set-Content -NoNewline -Encoding ascii -LiteralPath (Join-Path dist "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-release
+          path: dist/LocalKnowledgeHub-Setup-*
+          if-no-files-found: error
+
+  release:
+    needs: [portable, windows-installer]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          merge-multiple: true
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag --generate-notes
+          --title "Local Knowledge Hub $GITHUB_REF_NAME"

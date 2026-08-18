@@ -3,7 +3,9 @@ param(
     [string]$InstallDir = "",
     [switch]$WithoutServices,
     [switch]$NoStart,
-    [switch]$SkipPythonDeps
+    [switch]$SkipPythonDeps,
+    [switch]$EnableAutoUpdate,
+    [switch]$NoAutoUpdate
 )
 
 Set-StrictMode -Version Latest
@@ -56,6 +58,9 @@ function Invoke-PythonLauncher($Launcher, [string[]]$Arguments) {
 
 if (-not (Test-IsWindows)) {
     throw "This installer supports Windows only. Use install.sh on macOS."
+}
+if ($EnableAutoUpdate -and $NoAutoUpdate) {
+    throw "EnableAutoUpdate and NoAutoUpdate cannot be used together."
 }
 
 $packageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -123,6 +128,11 @@ $managerArgs = @(
 )
 if ($WithoutServices) {
     $managerArgs += "--without-services"
+}
+if ($EnableAutoUpdate) {
+    $managerArgs += "--auto-update"
+} elseif ($NoAutoUpdate) {
+    $managerArgs += "--no-auto-update"
 }
 & $venvPython @managerArgs
 if ($LASTEXITCODE -ne 0) {

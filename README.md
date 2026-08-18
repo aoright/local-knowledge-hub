@@ -28,16 +28,17 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.2.3.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.3.0.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
-privileges.
+privileges. The **Enable automatic updates (recommended)** option is selected by
+default and may be cleared before installation.
 
 The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.2.3.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.3.0.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -71,6 +72,12 @@ Core-only installation without Onyx or SearXNG:
 The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
+
+Version 1.3.0 adds verified self-updates. A per-user daily task checks GitHub's
+stable latest Release, compares semantic versions, downloads only the asset for the
+current platform, verifies its SHA-256 digest, and preserves the existing data,
+service mode, and update preference during installation. Automatic updates are on
+for new installations but remain user-controlled.
 
 Version 1.2.3 treats healthy Onyx and SearXNG HTTP endpoints as authoritative, so
 the watchdog no longer runs `docker info` every minute or starts a recovery cycle
@@ -122,6 +129,11 @@ Windows PowerShell:
 & "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\khub.cmd" status
 & "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-doctor.cmd"
 & "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\khub.cmd" web-search "latest MCP specification"
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-update.cmd" status
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-update.cmd" check
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-update.cmd" install
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-update.cmd" set-auto off
+& "$env:LOCALAPPDATA\LocalKnowledgeHub\bin\knowledge-hub-update.cmd" set-auto on
 ```
 
 macOS:
@@ -130,13 +142,18 @@ macOS:
 ~/.local/share/local-knowledge-hub/bin/khub status
 ~/.local/share/local-knowledge-hub/bin/knowledge-hub-doctor
 ~/.local/share/local-knowledge-hub/bin/khub web-search 'latest MCP specification'
+~/.local/share/local-knowledge-hub/bin/knowledge-hub-update status
+~/.local/share/local-knowledge-hub/bin/knowledge-hub-update check
+~/.local/share/local-knowledge-hub/bin/knowledge-hub-update install
+~/.local/share/local-knowledge-hub/bin/knowledge-hub-update set-auto off
+~/.local/share/local-knowledge-hub/bin/knowledge-hub-update set-auto on
 ```
 
 Onyx is available at <http://127.0.0.1:3000>. On first use, create the first account using the generated credentials under `data/config/admin.env` in the installation directory. Do not share this file.
 
 ## Automatic maintenance
 
-- Windows uses three per-user Task Scheduler jobs for service health, 30-minute incremental indexing, and daily backups.
+- Windows uses per-user Task Scheduler jobs for service health, 30-minute incremental indexing, daily backups, and daily verified updates.
 - Zero-document project review is non-destructive by default:
 
   ```bash
@@ -146,7 +163,7 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
   Existing project paths require both `--allow-existing-zero-docs` and an exact
   `--project <slug>` together with `--apply`. Only the knowledge-hub registration
   is removed; the local directory and its files are never touched.
-- macOS uses per-user LaunchAgents for the same jobs.
+- macOS uses per-user LaunchAgents for the same jobs. Turning automatic updates off keeps the local job installed but makes it exit before any network request, so it can be re-enabled without reinstalling.
 - Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
 - Git projects—and collection folders containing multiple Git repositories—use content-sensitive working-tree fingerprints, so unchanged projects avoid repeated full file walks. A full verification scan still runs at least once every 24 hours.
 - Daily scheduled backups preserve project registration, collections, long-term memories, history, embeddings, and audit records while omitting rebuildable file indexes and web caches. Existing full backups are retained separately; `maintenance.py backup --mode full` remains available for manual snapshots.
@@ -155,7 +172,7 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
 
 ## Upgrade
 
-Extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained. Upgrading a large existing database to the project-partitioned search index can take several minutes; the installer completes that one-time migration before it asks you to restart clients.
+Automatic updates are enabled by default. Use `knowledge-hub-update status` to inspect the setting, `set-auto off|on` to change it, `check` to check without installing, and `install` to update immediately. The updater accepts only the stable GitHub latest Release, restricts downloads to GitHub asset hosts, and requires a matching SHA-256 digest from Release metadata or the companion checksum asset. Manual installation remains supported: extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained.
 
 ## Uninstall
 

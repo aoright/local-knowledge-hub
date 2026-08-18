@@ -32,11 +32,13 @@ LABELS = {
     "start": "com.local-knowledge-hub.start",
     "index": "com.local-knowledge-hub.index",
     "backup": "com.local-knowledge-hub.backup",
+    "update": "com.local-knowledge-hub.update",
 }
 WINDOWS_TASKS = {
     "services": "LocalKnowledgeHub-Services",
     "index": "LocalKnowledgeHub-Index",
     "backup": "LocalKnowledgeHub-Backup",
+    "update": "LocalKnowledgeHub-Update",
 }
 
 
@@ -316,6 +318,15 @@ def write_wrappers(install_root: Path, platform_name: str | None = None) -> None
                 data,
                 ["doctor", "--install-root", str(install_root)],
             ),
+            "knowledge-hub-update.cmd": batch_wrapper(
+                python,
+                app / "src" / "update_manager.py",
+                data,
+                forward_arguments=True,
+            ),
+            "knowledge-hub-auto-update.cmd": batch_wrapper(
+                python, app / "src" / "update_manager.py", data, ["auto"]
+            ),
         }
         for name, content in wrappers.items():
             atomic_write(install_root / "bin" / name, content, 0o700)
@@ -330,6 +341,12 @@ def write_wrappers(install_root: Path, platform_name: str | None = None) -> None
             app / "src" / "install_manager.py",
             data,
             f"doctor --install-root {json.dumps(str(install_root))}",
+        ),
+        "knowledge-hub-update": shell_wrapper(
+            python, app / "src" / "update_manager.py", data
+        ),
+        "knowledge-hub-auto-update": shell_wrapper(
+            python, app / "src" / "update_manager.py", data, "auto"
         ),
     }
     for name, content in wrappers.items():
@@ -389,6 +406,10 @@ def install_launch_agents(home: Path, install_root: Path, services: bool) -> lis
             [python, str(app / "maintenance.py"), "backup", "--mode", "critical", "--retain", "14"],
             install_root, {"StartCalendarInterval": {"Hour": 3, "Minute": 15}},
         ),
+        "update": plist_payload(
+            LABELS["update"], [python, str(app / "update_manager.py"), "auto"],
+            install_root, {"StartCalendarInterval": {"Hour": 4, "Minute": 15}},
+        ),
     }
     if services:
         definitions["start"] = plist_payload(
@@ -436,13 +457,19 @@ def install_scheduled_tasks(install_root: Path, services: bool) -> list[str]:
     definitions = {
         "index": ["/SC", "MINUTE", "/MO", "30"],
         "backup": ["/SC", "DAILY", "/ST", "03:15"],
+        "update": ["/SC", "DAILY", "/ST", "04:15"],
     }
     if services:
         definitions["services"] = ["/SC", "MINUTE", "/MO", "5"]
     installed: list[str] = []
     for suffix, schedule in definitions.items():
         task_name = WINDOWS_TASKS[suffix]
-        wrapper = install_root / "bin" / f"knowledge-hub-{suffix}.cmd"
+        wrapper_name = (
+            "knowledge-hub-auto-update.cmd"
+            if suffix == "update"
+            else f"knowledge-hub-{suffix}.cmd"
+        )
+        wrapper = install_root / "bin" / wrapper_name
         schtasks(["/Delete", "/TN", task_name, "/F"], check=False)
         schtasks(
             [
@@ -472,7 +499,37 @@ def uninstall_scheduled_tasks() -> list[str]:
     return removed
 
 
-def initialize(install_root: Path, source_app: Path, services: bool) -> dict[str, Any]:
+def configure_update_settings(
+    data: Path,
+    services: bool,
+    auto_update: bool | None,
+) -> dict[str, Any]:
+    path = data / "config" / "update.json"
+    existing: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                existing = value
+        except json.JSONDecodeError:
+            existing = {}
+    enabled = bool(existing.get("auto_update", True)) if auto_update is None else auto_update
+    settings = {
+        **existing,
+        "auto_update": enabled,
+        "services_enabled": services,
+        "repository": "aoright/local-knowledge-hub",
+    }
+    atomic_write(path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    return settings
+
+
+def initialize(
+    install_root: Path,
+    source_app: Path,
+    services: bool,
+    auto_update: bool | None = None,
+) -> dict[str, Any]:
     install_root = install_root.expanduser().resolve()
     source_app = source_app.resolve()
     data = install_root / "data"
@@ -515,6 +572,7 @@ def initialize(install_root: Path, source_app: Path, services: bool) -> dict[str
     if platform_name not in {"macos", "windows"}:
         raise RuntimeError(f"Unsupported platform: {platform_name}")
     write_wrappers(install_root, platform_name)
+    update_settings = configure_update_settings(data, services, auto_update)
     home = Path.home()
     clients = configure_clients(home, install_root, True)
     agents: list[str] = []
@@ -530,6 +588,7 @@ def initialize(install_root: Path, source_app: Path, services: bool) -> dict[str
         "clients": clients,
         "launch_agents": agents,
         "scheduled_tasks": tasks,
+        "automatic_updates": update_settings["auto_update"],
         "onyx_credentials": str(credentials),
     }
 
@@ -545,6 +604,7 @@ def doctor(install_root: Path) -> dict[str, Any]:
         "gateway": gateway_path(install_root, platform_name).is_file(),
         "private_onyx_config": (data / "config" / "onyx.env").is_file(),
         "private_search_config": (data / "config" / "searxng" / "settings.yml").is_file(),
+        "update_config": (data / "config" / "update.json").is_file(),
     }
     if db_path.is_file():
         db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -558,7 +618,7 @@ def doctor(install_root: Path) -> dict[str, Any]:
         checks["database"] = "not_initialized"
     checks["passed"] = all(
         value is True for key, value in checks.items()
-        if key in {"app", "python", "gateway", "private_onyx_config", "private_search_config"}
+        if key in {"app", "python", "gateway", "private_onyx_config", "private_search_config", "update_config"}
     ) and checks["database"] in {"ok", "not_initialized"}
     return checks
 
@@ -570,6 +630,10 @@ def main() -> int:
     setup.add_argument("--install-root", type=Path, required=True)
     setup.add_argument("--source-app", type=Path, required=True)
     setup.add_argument("--without-services", action="store_true")
+    update_group = setup.add_mutually_exclusive_group()
+    update_group.add_argument("--auto-update", dest="auto_update", action="store_true")
+    update_group.add_argument("--no-auto-update", dest="auto_update", action="store_false")
+    setup.set_defaults(auto_update=None)
     unconfigure = sub.add_parser("unconfigure")
     unconfigure.add_argument("--install-root", type=Path, required=True)
     check = sub.add_parser("doctor")
@@ -578,7 +642,12 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "initialize":
-        value = initialize(args.install_root, args.source_app, not args.without_services)
+        value = initialize(
+            args.install_root,
+            args.source_app,
+            not args.without_services,
+            args.auto_update,
+        )
     elif args.command == "unconfigure":
         platform_name = current_platform()
         value = {

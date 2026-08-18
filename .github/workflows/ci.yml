@@ -41,6 +41,7 @@ jobs:
           export KHUB_SKIP_LAUNCHCTL=1
           ./install.sh --without-services --install-dir "$RUNNER_TEMP/LocalKnowledgeHub"
           "$RUNNER_TEMP/LocalKnowledgeHub/bin/knowledge-hub-doctor"
+          "$RUNNER_TEMP/LocalKnowledgeHub/bin/knowledge-hub-update" status
           "$RUNNER_TEMP/LocalKnowledgeHub/uninstall.sh" --purge-data
       - name: Windows clean install, doctor, and purge uninstall
         if: runner.os == 'Windows'
@@ -69,6 +70,8 @@ jobs:
           & (Join-Path $installRoot "bin\knowledge-hub-doctor.cmd")
           schtasks.exe /Query /TN LocalKnowledgeHub-Index
           schtasks.exe /Query /TN LocalKnowledgeHub-Backup
+          schtasks.exe /Query /TN LocalKnowledgeHub-Update
+          & (Join-Path $installRoot "bin\knowledge-hub-update.cmd") status
           $mcpInput = @(
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"windows-ci","version":"1"}}}',
             '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',

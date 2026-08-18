@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.3"
+  #define MyAppVersion "1.3.0"
 #endif
 
 [Setup]
@@ -35,6 +35,9 @@ Name: "compact"; Description: "Core local knowledge only"
 Name: "core"; Description: "Local knowledge, memory, indexing, and client integration"; Types: full compact; Flags: fixed
 Name: "services"; Description: "Onyx UI and private SearXNG web search (requires Docker Desktop)"; Types: full
 
+[Tasks]
+Name: "autoupdate"; Description: "Enable automatic updates (recommended)"; Flags: checkedonce
+
 [Files]
 Source: "app\*"; DestDir: "{tmp}\LocalKnowledgeHubPackage\app"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "install.ps1"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
@@ -57,6 +60,10 @@ begin
   Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + InstallerPath + '"';
   if not WizardIsComponentSelected('services') then
     Parameters := Parameters + ' -WithoutServices';
+  if WizardIsTaskSelected('autoupdate') then
+    Parameters := Parameters + ' -EnableAutoUpdate'
+  else
+    Parameters := Parameters + ' -NoAutoUpdate';
 
   WizardForm.StatusLabel.Caption := 'Configuring Local Knowledge Hub and installing dependencies...';
   if not Exec(PowerShellPath, Parameters, '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then

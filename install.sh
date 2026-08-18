@@ -6,6 +6,7 @@ INSTALL_ROOT=${LOCAL_KNOWLEDGE_HOME:-"$HOME/.local/share/local-knowledge-hub"}
 WITH_SERVICES=1
 START_NOW=1
 INSTALL_DEPS=1
+AUTO_UPDATE=""
 
 usage() {
   printf '%s\n' \
@@ -13,7 +14,9 @@ usage() {
     "  --install-dir PATH       Installation directory" \
     "  --without-services       Do not install/start Onyx and SearXNG launch agent" \
     "  --no-start               Install services but do not start them now" \
-    "  --skip-python-deps       Test/offline mode; do not pip install requirements"
+    "  --skip-python-deps       Test/offline mode; do not pip install requirements" \
+    "  --auto-update            Enable daily verified automatic updates" \
+    "  --no-auto-update         Disable automatic update checks"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -22,6 +25,8 @@ while [ "$#" -gt 0 ]; do
     --without-services) WITH_SERVICES=0; shift ;;
     --no-start) START_NOW=0; shift ;;
     --skip-python-deps) INSTALL_DEPS=0; shift ;;
+    --auto-update) AUTO_UPDATE=1; shift ;;
+    --no-auto-update) AUTO_UPDATE=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -78,13 +83,16 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
   "$INSTALL_ROOT/venv/bin/python3" -m pip install --disable-pip-version-check -r "$INSTALL_ROOT/app/requirements.txt"
 fi
 
-MANAGER_ARGS=""
+set -- initialize --install-root "$INSTALL_ROOT" --source-app "$INSTALL_ROOT/app"
 if [ "$WITH_SERVICES" -eq 0 ]; then
-  MANAGER_ARGS="--without-services"
+  set -- "$@" --without-services
 fi
-# shellcheck disable=SC2086
-"$INSTALL_ROOT/venv/bin/python3" "$INSTALL_ROOT/app/src/install_manager.py" initialize \
-  --install-root "$INSTALL_ROOT" --source-app "$INSTALL_ROOT/app" $MANAGER_ARGS
+if [ "$AUTO_UPDATE" = "1" ]; then
+  set -- "$@" --auto-update
+elif [ "$AUTO_UPDATE" = "0" ]; then
+  set -- "$@" --no-auto-update
+fi
+"$INSTALL_ROOT/venv/bin/python3" "$INSTALL_ROOT/app/src/install_manager.py" "$@"
 
 export KHUB_DATA_DIR="$INSTALL_ROOT/data"
 "$INSTALL_ROOT/bin/khub" init >/dev/null
