@@ -28,7 +28,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.2.2.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.2.3.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges.
@@ -37,7 +37,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.2.2.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.2.3.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -72,6 +72,19 @@ The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
 
+Version 1.2.3 treats healthy Onyx and SearXNG HTTP endpoints as authoritative, so
+the watchdog no longer runs `docker info` every minute or starts a recovery cycle
+because of a transient Docker CLI timeout. MCP audits distinguish Codex,
+Antigravity, and Antigravity IDE from safe parent-process markers without storing
+command arguments or CSRF tokens. Project status now identifies zero-document and
+missing-path registrations. `project-quality-review` is dry-run by default and can
+remove only explicitly named metadata records; it never deletes project directories.
+An explicit, previously unknown workspace path is now registered even when it is a
+non-Git document project; inferred Antigravity paths remain Git-only. PDF indexing
+extracts bounded text through Poppler or the cross-platform `pypdf` fallback, keeps
+titles for scans and oversized files, and adds a project-scoped substring fallback
+for unsegmented Chinese search terms.
+
 Version 1.2.2 validates automatic memory from the user's original evidence only.
 Questions, transient UI feedback, and implementation requests are rejected, and an
 assistant-generated title cannot promote project memory into a global scope. Existing
@@ -97,8 +110,9 @@ IDE clients from silently issuing an unscoped query when the MCP process itself 
 started from `/`. If Antigravity omits the field anyway, the gateway reads only the
 most recently user-active conversation's local workspace metadata, requires a unique
 recent match, and resolves that path without reading conversation content. A new Git
-workspace is registered and indexed automatically; stale or ambiguous activity still
-fails closed.
+workspace inferred this way is registered and indexed automatically; an explicit
+absolute workspace path may also create a non-Git document project. Stale or
+ambiguous inferred activity still fails closed.
 
 ## Commands
 
@@ -123,6 +137,15 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
 ## Automatic maintenance
 
 - Windows uses three per-user Task Scheduler jobs for service health, 30-minute incremental indexing, and daily backups.
+- Zero-document project review is non-destructive by default:
+
+  ```bash
+  python app/src/maintenance.py project-quality-review --minimum-age-days 7
+  ```
+
+  Existing project paths require both `--allow-existing-zero-docs` and an exact
+  `--project <slug>` together with `--apply`. Only the knowledge-hub registration
+  is removed; the local directory and its files are never touched.
 - macOS uses per-user LaunchAgents for the same jobs.
 - Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
 - Git projects—and collection folders containing multiple Git repositories—use content-sensitive working-tree fingerprints, so unchanged projects avoid repeated full file walks. A full verification scan still runs at least once every 24 hours.

@@ -56,6 +56,9 @@ LEGACY_CONVERSATION_RUNTIME = Path(
     )
 ).expanduser().resolve()
 MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_PDF_BYTES = int(os.environ.get("KHUB_MAX_PDF_BYTES", str(100 * 1024 * 1024)))
+MAX_PDF_PAGES = int(os.environ.get("KHUB_MAX_PDF_PAGES", "200"))
+MAX_PDF_TEXT_CHARS = int(os.environ.get("KHUB_MAX_PDF_TEXT_CHARS", "500000"))
 CHUNK_CHARS = 1_600
 CHUNK_OVERLAP = 240
 
@@ -1032,15 +1035,77 @@ def select_recent_antigravity_workspace(
     return next(iter(recent_roots)) if len(recent_roots) == 1 else None
 
 
+def parent_process_command(timeout: float = 1.0) -> str:
+    """Read the direct parent command for local client attribution only."""
+    if not shutil.which("ps"):
+        return ""
+    try:
+        return subprocess.run(
+            ["ps", "-p", str(os.getppid()), "-o", "args="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def infer_client_surface(client_name: str, parent_command: str = "") -> str:
+    """Distinguish local app surfaces without persisting command arguments."""
+    name = (client_name or "unknown").casefold()
+    command = parent_command.casefold()
+    ide_markers = (
+        "antigravity ide.app",
+        "--app_data_dir antigravity-ide",
+        "--app-data-dir antigravity-ide",
+        "--subclient_type ide",
+        "--subclient-type ide",
+    )
+    standalone_markers = (
+        "/antigravity.app/",
+        "--standalone",
+        "--subclient_type standalone",
+        "--subclient-type standalone",
+    )
+    if "antigravity-ide" in name or "antigravity ide" in name or any(
+        marker in command for marker in ide_markers
+    ):
+        return "antigravity-ide"
+    if name.startswith("antigravity") or any(
+        marker in command for marker in standalone_markers
+    ):
+        return "antigravity"
+    if "codex" in name:
+        return "codex"
+    if name == "release-smoke":
+        return "release-smoke"
+    return "unknown"
+
+
+def client_runtime_identity(client_name: str) -> dict[str, Any]:
+    """Return safe audit metadata; never retain the full parent command."""
+    command = parent_process_command()
+    executable = ""
+    if command:
+        try:
+            arguments = shlex.split(command)
+            executable = Path(arguments[0]).name[:120] if arguments else ""
+        except ValueError:
+            executable = ""
+    return {
+        "surface": infer_client_surface(client_name, command),
+        "parent_pid": os.getppid(),
+        "parent_executable": executable,
+    }
+
+
 def antigravity_active_workspace(timeout: float = 2.0) -> str | None:
     """Read only the parent Antigravity process's loopback summary metadata."""
     if sys.platform != "darwin" or not shutil.which("ps") or not shutil.which("lsof"):
         return None
     try:
-        command = subprocess.run(
-            ["ps", "-p", str(os.getppid()), "-o", "args="],
-            check=True, capture_output=True, text=True, timeout=timeout,
-        ).stdout.strip()
+        command = parent_process_command(timeout)
         arguments = shlex.split(command)
         if not arguments or "language_server" not in Path(arguments[0]).name:
             return None
@@ -1091,17 +1156,37 @@ def slugify_project_name(value: str) -> str:
     return value.strip("-.") or "project"
 
 
-def register_active_workspace(db: sqlite3.Connection, workspace_path: str) -> str:
-    """Register and index a validated active IDE workspace that is not known yet."""
+def register_active_workspace(
+    db: sqlite3.Connection,
+    workspace_path: str,
+    *,
+    source: str = "antigravity_active_workspace",
+    require_git: bool = True,
+) -> str:
+    """Register and index a validated IDE workspace that is not known yet.
+
+    Inferred Antigravity paths remain Git-only. An absolute path supplied directly
+    by the client is already an explicit scope boundary, so document-only and other
+    non-Git workspaces may be registered as well.
+    """
     workspace = Path(workspace_path).expanduser().resolve(strict=False)
+    if workspace.is_file():
+        workspace = workspace.parent
+    if require_git and workspace.is_dir() and not (workspace / ".git").exists():
+        git_parent = next(
+            (parent for parent in workspace.parents if (parent / ".git").exists()),
+            None,
+        )
+        if git_parent is not None:
+            workspace = git_parent
     if (
         not workspace.is_dir()
         or workspace in {Path("/"), Path.home().resolve()}
-        or not (workspace / ".git").exists()
+        or (require_git and not (workspace / ".git").exists())
     ):
         raise ProjectResolutionError(
             "unresolved_project",
-            "活动工作区尚未登记，且不是可安全自动创建的 Git 项目",
+            "工作区尚未登记，且不符合安全自动创建条件",
         )
     existing = db.execute(
         "SELECT p.slug FROM project_paths pp JOIN projects p ON p.id=pp.project_id "
@@ -1123,7 +1208,8 @@ def register_active_workspace(db: sqlite3.Connection, workspace_path: str) -> st
         "path": str(workspace),
         "indexed": report.indexed,
         "chunks": report.chunks,
-        "source": "antigravity_active_workspace",
+        "source": source,
+        "require_git": require_git,
     })
     db.commit()
     return project["slug"]
@@ -1195,15 +1281,60 @@ def redact_secrets(text: str) -> tuple[str, int]:
     return text, count
 
 
+def extract_pdf_text(path: Path) -> tuple[str | None, str]:
+    if path.stat().st_size > MAX_PDF_BYTES:
+        return None, "pdf-title-only:size-limit"
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext:
+        try:
+            result = subprocess.run(
+                [
+                    pdftotext, "-f", "1", "-l", str(MAX_PDF_PAGES),
+                    "-layout", str(path), "-",
+                ],
+                capture_output=True,
+                timeout=90,
+            )
+            if result.returncode == 0:
+                text = result.stdout.decode("utf-8", errors="replace").strip()
+                if text:
+                    return text[:MAX_PDF_TEXT_CHARS], "pdf:pdftotext"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path), strict=False)
+        pages: list[str] = []
+        total = 0
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                continue
+            if not page_text:
+                continue
+            remaining = MAX_PDF_TEXT_CHARS - total
+            if remaining <= 0:
+                break
+            page_text = page_text[:remaining]
+            pages.append(page_text)
+            total += len(page_text)
+        text = "\n\n".join(pages).strip()
+        if text:
+            return text, "pdf:pypdf"
+    except (ImportError, OSError, ValueError):
+        pass
+    except Exception:
+        # Malformed/encrypted PDFs must not abort an entire project refresh.
+        pass
+    return None, "pdf-title-only:no-extractable-text"
+
+
 def extract_text(path: Path) -> tuple[str | None, str | None]:
     suffix = path.suffix.lower()
-    if suffix == ".pdf" and shutil.which("pdftotext"):
-        result = subprocess.run(
-            ["pdftotext", "-layout", str(path), "-"], capture_output=True, timeout=90
-        )
-        if result.returncode == 0:
-            return result.stdout.decode("utf-8", errors="replace"), "pdf"
-        return None, "pdf-extract-failed"
+    if suffix == ".pdf":
+        return extract_pdf_text(path)
     if suffix not in TEXT_EXTENSIONS and path.name not in {"Dockerfile", "Makefile", "LICENSE"}:
         return None, "unsupported"
     try:
@@ -1284,7 +1415,7 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
             except OSError:
                 stats.skipped += 1
                 continue
-            if stat.st_size > MAX_FILE_BYTES:
+            if stat.st_size > MAX_FILE_BYTES and path.suffix.lower() != ".pdf":
                 stats.skipped += 1
                 continue
             rel = path.relative_to(root).as_posix()
@@ -1297,6 +1428,9 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
                 stats.unchanged += 1
                 continue
             text, extraction = extract_text(path)
+            if path.suffix.lower() == ".pdf":
+                descriptor = f"PDF 文档\n文件名：{path.stem}\n路径：{rel}"
+                text = f"{descriptor}\n\n{text}" if text else descriptor
             if text is None:
                 stats.skipped += 1
                 continue
@@ -1345,10 +1479,16 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
 
 
 def fts_query(query: str) -> str:
-    terms = list(dict.fromkeys(re.findall(r"[\w\-./\u3400-\u9fff]+", query, re.UNICODE)))
+    terms = query_terms(query)
     if not terms:
         raise ValueError("搜索词为空")
     return " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
+
+
+def query_terms(query: str) -> list[str]:
+    return list(dict.fromkeys(
+        re.findall(r"[\w\-./\u3400-\u9fff]+", query, re.UNICODE)
+    ))[:20]
 
 
 def scoped_fts_query(query: str, project_ids: list[str]) -> str:
@@ -1402,11 +1542,50 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
         """,
         (scoped_fts_query(query, project_ids), *project_ids, utcnow(), max(1, min(limit, 50))),
     ).fetchall()
+    retrieval_method = "lexical"
+    if not rows:
+        # unicode61 does not split unspaced CJK phrases into useful word tokens.
+        # A project-scoped substring fallback keeps Chinese filenames and PDF
+        # headings searchable without expanding into another project's corpus.
+        terms = [term.casefold() for term in query_terms(query) if len(term) >= 2]
+        if terms:
+            term_conditions: list[str] = []
+            term_values: list[str] = []
+            for term in terms:
+                term_conditions.append(
+                    "(instr(lower(c.title),?)>0 OR instr(lower(c.relative_path),?)>0 "
+                    "OR instr(lower(c.content),?)>0)"
+                )
+                term_values.extend((term, term, term))
+            rows = db.execute(
+                f"""
+                SELECT c.document_id,c.title,c.relative_path,c.content,d.source_type,d.source_uri,
+                       d.modified_at,c.project_id,p.slug AS scope_key,p.display_name AS scope_name,
+                       p.scope_type,mr.kind AS memory_kind,mr.status AS memory_status,
+                       mr.confidence AS memory_confidence,mr.evidence AS memory_evidence,
+                       NULL AS score
+                FROM chunks c
+                JOIN documents d ON d.id=c.document_id
+                JOIN projects p ON p.id=c.project_id
+                LEFT JOIN memory_records mr ON mr.document_id=d.id
+                WHERE c.project_id IN ({placeholders})
+                  AND ({' OR '.join(term_conditions)})
+                  AND (d.source_type!='memory' OR (
+                    mr.status='active' AND mr.valid_to IS NULL
+                    AND (mr.expires_at IS NULL OR mr.expires_at>?)
+                  ))
+                GROUP BY c.document_id
+                ORDER BY d.modified_at DESC
+                LIMIT ?
+                """,
+                (*project_ids, *term_values, utcnow(), max(1, min(limit, 50))),
+            ).fetchall()
+            retrieval_method = "substring"
     audit(db, "knowledge.search", scope["id"], {"scope_type": scope["type"], "query": query, "result_count": len(rows)})
     db.commit()
     results = [dict(row) for row in rows]
     for item in results:
-        item["retrieval_method"] = "lexical"
+        item["retrieval_method"] = retrieval_method
     return results
 
 
@@ -2244,6 +2423,16 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
             "bytes": counts["bytes"] if counts else 0,
             "chunks": chunk_counts.get(project["id"], 0),
         })
+    zero_document_projects = [
+        {
+            "slug": project["slug"],
+            "paths": project["paths"],
+            "all_paths_missing": not project["paths"]
+            or all(not Path(path).exists() for path in project["paths"]),
+        }
+        for project in projects
+        if project["documents"] == 0
+    ]
     global_scopes = []
     for project in list_global_scopes(db):
         counts = document_counts.get(project["id"])
@@ -2295,6 +2484,14 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
     return {
         "database": str(DEFAULT_DB),
         "projects": projects,
+        "project_health": {
+            "zero_document_count": len(zero_document_projects),
+            "missing_all_paths_count": sum(
+                1 for project in zero_document_projects
+                if project["all_paths_missing"]
+            ),
+            "zero_document_projects": zero_document_projects,
+        },
         "global_scopes": global_scopes,
         "collection_memory_scopes": collection_memory_scopes,
         "collections": collections,
@@ -2803,9 +3000,14 @@ def mcp_call(
         try:
             project_ref = resolve_project_reference(db, project_hint, workspace_hint)
         except ProjectResolutionError as initial_error:
-            if resolution_source == "antigravity_active_workspace" and workspace_hint:
+            if workspace_hint and not project_hint:
                 try:
-                    project_ref = register_active_workspace(db, workspace_hint)
+                    project_ref = register_active_workspace(
+                        db,
+                        workspace_hint,
+                        source=resolution_source,
+                        require_git=resolution_source != "arguments",
+                    )
                 except ProjectResolutionError as exc:
                     value = unresolved_context_response(
                         exc, str(args.get("query", "")),
@@ -2916,6 +3118,7 @@ def mcp_server(db_path: Path) -> None:
                         "name": str(raw_client.get("name", "unknown"))[:120],
                         "version": str(raw_client.get("version", ""))[:80],
                     }
+                client_info.update(client_runtime_identity(client_info["name"]))
                 audit(
                     db,
                     "mcp.initialize",
@@ -2932,7 +3135,10 @@ def mcp_server(db_path: Path) -> None:
                 started = time.monotonic()
                 try:
                     value = mcp_call(
-                        db, tool_name, params.get("arguments", {}), client_info.get("name")
+                        db,
+                        tool_name,
+                        params.get("arguments", {}),
+                        client_info.get("surface") or client_info.get("name"),
                     )
                 except Exception as exc:
                     audit(

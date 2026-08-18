@@ -196,7 +196,11 @@ def ensure_services() -> dict[str, object]:
         raise RuntimeError("Docker CLI 不存在；请安装 Docker Desktop，或通过 Homebrew 安装 docker 与 colima")
 
     initial = {"onyx": healthy(ONYX_HEALTH), "searxng": healthy(SEARXNG_HEALTH)}
-    if all(initial.values()) and docker_running():
+    # The service endpoints are the user-visible source of truth.  Avoid a
+    # potentially slow `docker info` probe every minute when both services are
+    # already healthy; transient daemon CLI timeouts previously triggered
+    # unnecessary compose recovery and noisy logs despite HTTP 200 responses.
+    if all(initial.values()):
         return {"action": "healthy", "services": initial}
 
     runtime_action = ensure_docker_runtime()

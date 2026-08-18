@@ -237,6 +237,33 @@ class KnowledgeHubTests(unittest.TestCase):
             str(Path("/tmp/current-project").resolve(strict=False)),
         )
 
+    def test_client_surface_uses_parent_process_without_persisting_arguments(self):
+        ide_command = (
+            "/Applications/Antigravity IDE.app/Contents/language_server "
+            "--csrf_token do-not-store --app_data_dir antigravity-ide "
+            "--subclient_type ide"
+        )
+        standalone_command = (
+            "/Applications/Antigravity.app/Contents/language_server "
+            "--csrf_token do-not-store --standalone"
+        )
+        self.assertEqual(
+            kh.infer_client_surface("antigravity-client", ide_command),
+            "antigravity-ide",
+        )
+        self.assertEqual(
+            kh.infer_client_surface("antigravity-client", standalone_command),
+            "antigravity",
+        )
+        self.assertEqual(kh.infer_client_surface("codex-mcp-client"), "codex")
+        with mock.patch.object(
+            kh, "parent_process_command", return_value=ide_command
+        ):
+            identity = kh.client_runtime_identity("antigravity-client")
+        self.assertEqual(identity["surface"], "antigravity-ide")
+        self.assertNotIn("command", identity)
+        self.assertNotIn("do-not-store", json.dumps(identity))
+
     def test_rejects_ambiguous_recent_antigravity_workspaces(self):
         recent = "2026-08-15T06:00:00Z"
         summaries = {
@@ -289,6 +316,74 @@ class KnowledgeHubTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+
+    def test_explicit_workspace_auto_registers_non_git_document_project(self):
+        workspace = Path(self.tmp.name) / "Architect Exam"
+        workspace.mkdir()
+        (workspace / "study-notes.md").write_text(
+            "interactive-presentation-architect-marker", encoding="utf-8"
+        )
+        value = kh.mcp_call(
+            self.db,
+            "knowledge_context",
+            {
+                "workspace_path": str(workspace),
+                "query": "interactive-presentation-architect-marker",
+            },
+            client_name="codex-mcp-client",
+        )
+        self.assertEqual(value["scope"]["slug"], "architect-exam")
+        self.assertEqual(value["result_counts"]["primary"], 1)
+        details = json.loads(
+            self.db.execute(
+                "SELECT details_json FROM audit_log "
+                "WHERE action='project.auto_registered' ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertEqual(details["source"], "arguments")
+        self.assertFalse(details["require_git"])
+
+    def test_inferred_non_git_workspace_still_fails_closed(self):
+        workspace = Path(self.tmp.name) / "Untrusted Folder"
+        workspace.mkdir()
+        with mock.patch.object(
+            kh, "antigravity_active_workspace", return_value=str(workspace)
+        ):
+            value = kh.mcp_call(
+                self.db,
+                "knowledge_context",
+                {"query": "marker"},
+                client_name="antigravity-client",
+            )
+        self.assertEqual(
+            value["resolution_required"]["code"], "unresolved_project"
+        )
+
+    def test_pdf_indexes_title_when_extraction_is_unavailable(self):
+        pdf = self.root / "系统架构师知识点.pdf"
+        pdf.write_bytes(b"%PDF-1.4\nnot-a-real-pdf")
+        with mock.patch.object(
+            kh,
+            "extract_pdf_text",
+            return_value=(None, "pdf-title-only:no-extractable-text"),
+        ):
+            stats = kh.ingest_project(self.db, "alpha")
+        self.assertEqual(stats.indexed, 1)
+        result = kh.search(self.db, "alpha", "架构师知识点")
+        self.assertEqual(len(result), 1)
+        self.assertIn("文件名：系统架构师知识点", result[0]["content"])
+
+    def test_pdf_extraction_timeout_falls_back_without_aborting(self):
+        pdf = self.root / "timeout.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        with mock.patch.object(kh.shutil, "which", return_value="pdftotext"), mock.patch.object(
+            kh.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("pdftotext", 90),
+        ), mock.patch.dict(sys.modules, {"pypdf": None}):
+            text, extraction = kh.extract_pdf_text(pdf)
+        self.assertIsNone(text)
+        self.assertEqual(extraction, "pdf-title-only:no-extractable-text")
 
     def test_resolve_project_accepts_unique_human_suffix_without_scope_leak(self):
         other_root = Path(self.tmp.name) / "nunu"

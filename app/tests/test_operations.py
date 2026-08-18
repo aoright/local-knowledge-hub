@@ -39,11 +39,12 @@ class OperationsTests(unittest.TestCase):
                 mock.patch.object(start, "COLIMA", colima),
                 mock.patch.object(start, "DOCKER", docker),
                 mock.patch.object(start, "healthy", side_effect=[True, True]),
-                mock.patch.object(start, "docker_running", return_value=True),
+                mock.patch.object(start, "docker_running") as docker_running,
                 mock.patch.object(start, "run") as runner,
             ):
                 result = start.ensure_services()
         self.assertEqual(result["action"], "healthy")
+        docker_running.assert_not_called()
         runner.assert_not_called()
 
     def test_service_watchdog_starts_vm_and_both_stacks(self):
@@ -323,6 +324,82 @@ class OperationsTests(unittest.TestCase):
             self.assertGreater(preview["reclaimable_bytes"], 0)
             self.assertTrue(applied["applied"])
             self.assertEqual(len(list(backup_dir.glob("*.sqlite3.gz"))), 4)
+
+    def test_empty_project_review_only_prunes_explicit_stale_missing_paths(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            existing = root / "existing"
+            missing = root / "missing"
+            existing.mkdir()
+            missing.mkdir()
+            db_path = root / "knowledge.sqlite3"
+            db = maintenance.kh.connect(db_path)
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "existing", "Existing", str(existing))
+            maintenance.kh.add_project(db, "missing", "Missing", str(missing))
+            db.execute(
+                "UPDATE projects SET updated_at='2020-01-01T00:00:00+00:00' "
+                "WHERE slug IN ('existing','missing')"
+            )
+            db.commit()
+            db.close()
+            missing.rmdir()
+
+            preview = maintenance.review_empty_projects(
+                minimum_age_days=7, db_path=db_path
+            )
+            with self.assertRaises(ValueError):
+                maintenance.review_empty_projects(
+                    apply=True, minimum_age_days=7, db_path=db_path
+                )
+            with self.assertRaises(ValueError):
+                maintenance.review_empty_projects(
+                    apply=True,
+                    project_slugs=["existing"],
+                    minimum_age_days=7,
+                    db_path=db_path,
+                )
+            applied = maintenance.review_empty_projects(
+                apply=True,
+                project_slugs=["missing"],
+                minimum_age_days=7,
+                db_path=db_path,
+            )
+            existing_preview = maintenance.review_empty_projects(
+                minimum_age_days=7,
+                allow_existing_paths=True,
+                db_path=db_path,
+            )
+            existing_applied = maintenance.review_empty_projects(
+                apply=True,
+                project_slugs=["existing"],
+                minimum_age_days=7,
+                allow_existing_paths=True,
+                db_path=db_path,
+            )
+            check = maintenance.kh.connect(db_path)
+            remaining = [
+                row[0] for row in check.execute(
+                    "SELECT slug FROM projects WHERE scope_type='project' ORDER BY slug"
+                )
+            ]
+            audit_count = check.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE action='project.metadata_pruned'"
+            ).fetchone()[0]
+            check.close()
+            existing_still_exists = existing.is_dir()
+
+        self.assertEqual(preview["zero_document_count"], 2)
+        self.assertEqual([item["slug"] for item in preview["candidates"]], ["missing"])
+        self.assertEqual(applied["removed"], ["missing"])
+        self.assertEqual(
+            [item["slug"] for item in existing_preview["candidates"]],
+            ["existing"],
+        )
+        self.assertEqual(existing_applied["removed"], ["existing"])
+        self.assertTrue(existing_still_exists)
+        self.assertEqual(remaining, [])
+        self.assertEqual(audit_count, 2)
 
     def test_memory_quality_review_quarantines_without_deleting(self):
         with tempfile.TemporaryDirectory() as value:

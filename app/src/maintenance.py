@@ -185,6 +185,134 @@ def review_automatic_memories(
     }
 
 
+def review_empty_projects(
+    apply: bool = False,
+    project_slugs: list[str] | None = None,
+    minimum_age_days: int = 7,
+    allow_existing_paths: bool = False,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Audit zero-document projects and prune only explicit stale missing paths."""
+    if minimum_age_days < 0:
+        raise ValueError("minimum_age_days 不能小于 0")
+    requested = list(dict.fromkeys(project_slugs or []))
+    if apply and not requested:
+        raise ValueError("应用项目清理时必须用 --project 精确指定预览中的项目")
+    db = kh.connect(db_path or kh.DEFAULT_DB)
+    kh.initialize(db)
+    now = datetime.now(timezone.utc)
+    rows = db.execute(
+        "SELECT p.id,p.slug,p.display_name,p.created_at,p.updated_at,"
+        "(SELECT COUNT(*) FROM documents d WHERE d.project_id=p.id) AS documents,"
+        "(SELECT COUNT(*) FROM collection_members cm WHERE cm.project_id=p.id) AS collections "
+        "FROM projects p WHERE p.scope_type='project' "
+        "AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.project_id=p.id) "
+        "ORDER BY p.slug"
+    ).fetchall()
+    reviews: list[dict[str, Any]] = []
+    for row in rows:
+        paths = [
+            path_row["path"]
+            for path_row in db.execute(
+                "SELECT path FROM project_paths WHERE project_id=? AND active=1 ORDER BY path",
+                (row["id"],),
+            )
+        ]
+        path_states = []
+        for value in paths:
+            path = Path(value)
+            try:
+                exists = path.exists()
+                is_dir = path.is_dir()
+            except OSError:
+                exists = is_dir = False
+            path_states.append({"path": value, "exists": exists, "is_dir": is_dir})
+        try:
+            updated_at = datetime.fromisoformat(
+                str(row["updated_at"]).replace("Z", "+00:00")
+            )
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age_days = max(0, int((now - updated_at).total_seconds() // 86_400))
+        except (TypeError, ValueError):
+            age_days = 0
+        all_paths_missing = not path_states or all(
+            not item["exists"] for item in path_states
+        )
+        eligible = (
+            int(row["collections"]) == 0
+            and age_days >= minimum_age_days
+            and (all_paths_missing or allow_existing_paths)
+        )
+        if int(row["collections"]):
+            reason = "collection_member"
+        elif age_days < minimum_age_days:
+            reason = "recent_project"
+        elif not all_paths_missing and not allow_existing_paths:
+            reason = "path_still_exists"
+        elif not all_paths_missing:
+            reason = "explicit_existing_zero_documents"
+        else:
+            reason = "stale_missing_paths"
+        reviews.append({
+            "project_id": row["id"],
+            "slug": row["slug"],
+            "display_name": row["display_name"],
+            "updated_at": row["updated_at"],
+            "age_days": age_days,
+            "documents": int(row["documents"]),
+            "collection_memberships": int(row["collections"]),
+            "paths": path_states,
+            "eligible": eligible,
+            "reason": reason,
+        })
+    candidates = [item for item in reviews if item["eligible"]]
+    candidate_by_slug = {item["slug"]: item for item in candidates}
+    removed: list[str] = []
+    if apply:
+        invalid = [slug for slug in requested if slug not in candidate_by_slug]
+        if invalid:
+            db.close()
+            raise ValueError(
+                "以下项目不在安全清理候选中：" + ", ".join(invalid)
+            )
+        for slug in requested:
+            target = candidate_by_slug[slug]
+            deleted = db.execute(
+                "DELETE FROM projects WHERE id=? AND scope_type='project' "
+                "AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.project_id=projects.id)",
+                (target["project_id"],),
+            ).rowcount
+            if deleted != 1:
+                db.rollback()
+                db.close()
+                raise RuntimeError(f"项目状态已变化，停止清理：{slug}")
+            kh.audit(
+                db,
+                "project.metadata_pruned",
+                None,
+                {
+                    "project_id": target["project_id"],
+                    "slug": slug,
+                    "paths": [item["path"] for item in target["paths"]],
+                    "reason": target["reason"],
+                },
+            )
+            removed.append(slug)
+        db.commit()
+    db.close()
+    return {
+        "applied": apply,
+        "minimum_age_days": minimum_age_days,
+        "allow_existing_paths": allow_existing_paths,
+        "zero_document_count": len(reviews),
+        "eligible_count": len(candidates),
+        "candidates": candidates,
+        "review_only": [item for item in reviews if not item["eligible"]],
+        "removed": removed,
+    }
+
+
 def lock():
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.parent.chmod(0o700)
@@ -564,6 +692,11 @@ def main() -> int:
     prune.add_argument("--apply", action="store_true")
     memory_review = sub.add_parser("memory-quality-review")
     memory_review.add_argument("--apply", action="store_true")
+    project_review = sub.add_parser("project-quality-review")
+    project_review.add_argument("--minimum-age-days", type=int, default=7)
+    project_review.add_argument("--project", action="append", default=[])
+    project_review.add_argument("--allow-existing-zero-docs", action="store_true")
+    project_review.add_argument("--apply", action="store_true")
     sub.add_parser("health")
     sub.add_parser("memory-maintain")
     sub.add_parser("memory-embed")
@@ -585,6 +718,13 @@ def main() -> int:
         )
     elif args.command == "memory-quality-review":
         value = review_automatic_memories(args.apply)
+    elif args.command == "project-quality-review":
+        value = review_empty_projects(
+            args.apply,
+            args.project,
+            args.minimum_age_days,
+            args.allow_existing_zero_docs,
+        )
     elif args.command == "memory-maintain":
         db = kh.connect()
         kh.initialize(db)
