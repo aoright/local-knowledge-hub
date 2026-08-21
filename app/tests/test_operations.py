@@ -1,12 +1,13 @@
 import importlib.util
 import json
+import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-
 
 SRC = Path(__file__).parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -29,6 +30,104 @@ maintenance = load("maintenance")
 
 
 class OperationsTests(unittest.TestCase):
+    def test_health_uses_lightweight_probe_and_returns_compact_status(self):
+        with tempfile.TemporaryDirectory() as value:
+            database_path = Path(value) / "knowledge.sqlite3"
+            real_connect = maintenance.kh.connect
+
+            class Response:
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            fresh = {
+                "index": {"ok": True},
+                "backup": {"ok": True},
+            }
+            with (
+                mock.patch.object(
+                    maintenance.kh,
+                    "connect",
+                    side_effect=lambda: real_connect(database_path),
+                ),
+                mock.patch.object(
+                    maintenance.urllib.request,
+                    "urlopen",
+                    return_value=Response(),
+                ),
+                mock.patch.object(
+                    maintenance.service_watchdog,
+                    "maintenance_freshness",
+                    return_value=fresh,
+                ),
+            ):
+                result = maintenance.health()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"]["project_count"], 0)
+        self.assertNotIn("projects", result["status"])
+
+    def test_maintenance_freshness_uses_index_and_backup_success_files(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            index_state = root / "index-state.json"
+            backups = root / "backups"
+            backups.mkdir()
+            backup = backups / "knowledge-hub-critical-test.sqlite3.gz"
+            index_state.write_text("{}", encoding="utf-8")
+            backup.write_bytes(b"backup")
+            os.utime(index_state, (9_000, 9_000))
+            os.utime(backup, (8_000, 8_000))
+            with (
+                mock.patch.object(start, "INDEX_STATE_FILE", index_state),
+                mock.patch.object(start, "BACKUP_DIR", backups),
+                mock.patch.object(start, "INDEX_STALE_SECONDS", 2_000),
+                mock.patch.object(start, "BACKUP_STALE_SECONDS", 3_000),
+            ):
+                status = start.maintenance_freshness(now=10_000)
+        self.assertTrue(status["index"]["ok"])
+        self.assertTrue(status["backup"]["ok"])
+        self.assertEqual(status["index"]["age_seconds"], 1_000)
+
+    def test_maintenance_recovery_backs_up_before_indexing(self):
+        stale = {
+            "index": {"ok": False, "last_success_at": None, "age_seconds": None,
+                      "maximum_age_seconds": 100},
+            "backup": {"ok": False, "last_success_at": None, "age_seconds": None,
+                       "maximum_age_seconds": 100},
+        }
+        with (
+            mock.patch.object(start, "maintenance_freshness", return_value=stale),
+            mock.patch.object(start, "maintenance_busy", return_value=False),
+            mock.patch.object(start, "dispatch_maintenance") as dispatch,
+            mock.patch.object(
+                start, "_LAST_MAINTENANCE_DISPATCH", {"index": 0.0, "backup": 0.0}
+            ),
+            mock.patch.object(start, "_MAINTENANCE_CHILDREN", []),
+        ):
+            result = start.recover_stale_maintenance(now=10_000)
+        self.assertEqual(result["dispatched"], "backup")
+        dispatch.assert_called_once_with("backup")
+
+    def test_maintenance_recovery_does_not_queue_behind_active_job(self):
+        stale = {
+            "index": {"ok": False},
+            "backup": {"ok": False},
+        }
+        with (
+            mock.patch.object(start, "maintenance_freshness", return_value=stale),
+            mock.patch.object(start, "maintenance_busy", return_value=True),
+            mock.patch.object(start, "dispatch_maintenance") as dispatch,
+            mock.patch.object(start, "_MAINTENANCE_CHILDREN", []),
+        ):
+            result = start.recover_stale_maintenance(now=10_000)
+        self.assertTrue(result["busy"])
+        dispatch.assert_not_called()
+
     def test_service_watchdog_is_idempotent_when_healthy(self):
         with tempfile.TemporaryDirectory() as value:
             colima = Path(value) / "colima"
@@ -324,6 +423,87 @@ class OperationsTests(unittest.TestCase):
             self.assertGreater(preview["reclaimable_bytes"], 0)
             self.assertTrue(applied["applied"])
             self.assertEqual(len(list(backup_dir.glob("*.sqlite3.gz"))), 4)
+
+    def test_index_budget_review_is_dry_run_and_requires_explicit_project_to_apply(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            project = root / "project"
+            project.mkdir()
+            db_path = root / "knowledge.sqlite3"
+            state_path = root / "index-state.json"
+            policy_path = root / "index-policy.json"
+            policy_path.write_text(json.dumps({
+                "defaults": {
+                    "max_documents": 2,
+                    "max_chunks": 20,
+                    "max_chunks_per_document": 10,
+                }
+            }), encoding="utf-8")
+            for index in range(4):
+                (project / f"file-{index}.md").write_text(
+                    f"budget-review-marker-{index}", encoding="utf-8"
+                )
+            original_connect = maintenance.kh.connect
+            db = original_connect(db_path)
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "alpha", "Alpha", str(project))
+            maintenance.kh.ingest_project(db, "alpha")
+            db.close()
+            with (
+                mock.patch.object(
+                    maintenance.kh,
+                    "connect",
+                    side_effect=lambda: original_connect(db_path),
+                ),
+                mock.patch.object(maintenance.kh, "INDEX_POLICY_FILE", policy_path),
+                mock.patch.object(maintenance, "INDEX_STATE_FILE", state_path),
+                mock.patch.object(
+                    maintenance, "backup", return_value={"mode": "critical"}
+                ) as backup,
+            ):
+                preview = maintenance.review_index_budgets(False, ["alpha"])
+                with self.assertRaises(ValueError):
+                    maintenance.review_index_budgets(True, [])
+                applied = maintenance.review_index_budgets(True, ["alpha"])
+            check = sqlite3.connect(db_path)
+            remaining = check.execute(
+                "SELECT COUNT(*) FROM documents WHERE source_type='file'"
+            ).fetchone()[0]
+            check.close()
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["remove_documents"], 2)
+        self.assertEqual(applied["removed_documents"], 2)
+        self.assertEqual(remaining, 2)
+        backup.assert_called_once_with(retain=14, mode="critical")
+
+    def test_index_compaction_requires_client_confirmation_and_backup(self):
+        with tempfile.TemporaryDirectory() as value:
+            db_path = Path(value) / "knowledge.sqlite3"
+            db = maintenance.kh.connect(db_path)
+            maintenance.kh.initialize(db)
+            db.execute(
+                "INSERT INTO audit_log(event_at,action,project_id,details_json) "
+                "VALUES('2026-01-01T00:00:00+00:00','test',NULL,'{}')"
+            )
+            db.commit()
+            db.close()
+            preview = maintenance.compact_index(False, False, db_path)
+            with self.assertRaises(ValueError):
+                maintenance.compact_index(True, False, db_path)
+            with (
+                mock.patch.object(
+                    maintenance, "backup", return_value={"mode": "critical"}
+                ) as backup,
+                mock.patch.object(
+                    maintenance,
+                    "checkpoint_database",
+                    return_value={"mode": "truncate"},
+                ),
+            ):
+                applied = maintenance.compact_index(True, True, db_path)
+        self.assertFalse(preview["applied"])
+        self.assertEqual(applied["integrity"], "ok")
+        backup.assert_called_once_with(retain=14, mode="critical")
 
     def test_empty_project_review_only_prunes_explicit_stale_missing_paths(self):
         with tempfile.TemporaryDirectory() as value:

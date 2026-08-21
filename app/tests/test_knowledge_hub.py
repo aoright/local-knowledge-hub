@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -7,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-
 
 MODULE_PATH = Path(__file__).parents[1] / "src" / "knowledge_hub.py"
 SPEC = importlib.util.spec_from_file_location("knowledge_hub", MODULE_PATH)
@@ -37,6 +37,85 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertEqual(first.indexed, 1)
         self.assertEqual(second.unchanged, 1)
         self.assertEqual(len(kh.search(self.db, "alpha", "unique-alpha-marker")), 1)
+
+    def test_index_policy_keeps_manifests_and_recent_files_within_budget(self):
+        policy = Path(self.tmp.name) / "index-policy.json"
+        policy.write_text(json.dumps({
+            "defaults": {
+                "max_documents": 2,
+                "max_chunks": 20,
+                "max_chunks_per_document": 10,
+            }
+        }), encoding="utf-8")
+        readme = self.root / "README.md"
+        recent = self.root / "recent.md"
+        old = self.root / "old.md"
+        readme.write_text("manifest-marker", encoding="utf-8")
+        recent.write_text("recent-marker", encoding="utf-8")
+        old.write_text("old-marker", encoding="utf-8")
+        os.utime(old, (1, 1))
+        os.utime(recent, (2, 2))
+        os.utime(readme, (1, 1))
+        with mock.patch.object(kh, "INDEX_POLICY_FILE", policy):
+            stats = kh.ingest_project(self.db, "alpha")
+        self.assertTrue(stats.policy_limited)
+        self.assertEqual(stats.selected_documents, 2)
+        self.assertEqual(len(kh.search(self.db, "alpha", "manifest-marker")), 1)
+        self.assertEqual(len(kh.search(self.db, "alpha", "recent-marker")), 1)
+        self.assertEqual(kh.search(self.db, "alpha", "old-marker"), [])
+
+    def test_index_policy_caps_chunks_per_document(self):
+        policy = Path(self.tmp.name) / "index-policy.json"
+        policy.write_text(json.dumps({
+            "defaults": {
+                "max_documents": 10,
+                "max_chunks": 10,
+                "max_chunks_per_document": 2,
+            }
+        }), encoding="utf-8")
+        (self.root / "large.md").write_text("chunk-marker\n" * 1000, encoding="utf-8")
+        with mock.patch.object(kh, "INDEX_POLICY_FILE", policy):
+            stats = kh.ingest_project(self.db, "alpha")
+        self.assertEqual(stats.truncated_documents, 1)
+        self.assertEqual(stats.selected_chunks, 2)
+
+    def test_existing_over_budget_index_is_preserved_until_explicit_review(self):
+        for index in range(3):
+            (self.root / f"file-{index}.md").write_text(
+                f"preserve-marker-{index}", encoding="utf-8"
+            )
+        kh.ingest_project(self.db, "alpha")
+        policy = Path(self.tmp.name) / "index-policy.json"
+        policy.write_text(json.dumps({
+            "defaults": {
+                "max_documents": 2,
+                "max_chunks": 20,
+                "max_chunks_per_document": 10,
+            }
+        }), encoding="utf-8")
+        with mock.patch.object(kh, "INDEX_POLICY_FILE", policy):
+            stats = kh.ingest_project(self.db, "alpha")
+        self.assertEqual(stats.policy_reason, "existing_index_exceeds_policy")
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM documents WHERE source_type='file'"
+            ).fetchone()[0],
+            3,
+        )
+
+    def test_search_succeeds_when_telemetry_writer_is_busy(self):
+        (self.root / "note.md").write_text("nonblocking-audit-marker", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        database = self.db.execute("PRAGMA database_list").fetchone()[2]
+        blocker = sqlite3.connect(database)
+        blocker.execute("PRAGMA journal_mode=WAL")
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            results = kh.search(self.db, "alpha", "nonblocking-audit-marker")
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertEqual(len(results), 1)
 
     def test_secret_file_is_excluded_and_inline_secret_redacted(self):
         (self.root / ".env").write_text("PASSWORD=should-never-index", encoding="utf-8")
@@ -128,6 +207,25 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertEqual(project["documents"], 2)
         self.assertEqual(project["chunks"], 2)
         self.assertGreater(project["bytes"], 0)
+        self.assertFalse(project["index_over_budget"])
+        self.assertEqual(project["index_policy"]["max_documents"], 25_000)
+
+    def test_status_index_budget_excludes_long_term_memories(self):
+        (self.root / "one.md").write_text("first status marker", encoding="utf-8")
+        (self.root / "two.md").write_text("second status marker", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        kh.remember(self.db, "alpha", "Decision", "Keep durable project memory", "decision")
+        policy = {
+            "max_documents": 2,
+            "max_chunks": 2,
+            "max_chunks_per_document": 4_096,
+            "exclude_globs": [],
+        }
+        with mock.patch.object(kh, "load_index_policy", return_value=policy):
+            project = kh.status(self.db)["projects"][0]
+        self.assertEqual(project["documents"], 3)
+        self.assertEqual(project["chunks"], 3)
+        self.assertFalse(project["index_over_budget"])
 
     def test_mcp_tool_catalog_is_json_serializable(self):
         tools = kh.mcp_tools()
@@ -137,6 +235,8 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIs(remember_tool["inputSchema"]["properties"]["confirmed"]["const"], True)
         capture_tool = next(tool for tool in tools if tool["name"] == "knowledge_capture")
         self.assertNotIn("confidence", capture_tool["inputSchema"]["required"])
+        self.assertNotIn("workspace_path", capture_tool["inputSchema"]["required"])
+        self.assertIn("validation_rejected", capture_tool["description"])
         context_tool = next(tool for tool in tools if tool["name"] == "knowledge_context")
         self.assertEqual(
             context_tool["inputSchema"]["required"], ["query", "workspace_path"]

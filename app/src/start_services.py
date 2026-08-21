@@ -9,10 +9,11 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(os.environ.get("KHUB_DATA_DIR", ROOT / "runtime")).expanduser().resolve()
@@ -36,6 +37,17 @@ def default_docker() -> Path:
 DOCKER = Path(os.environ.get("KHUB_DOCKER", str(default_docker())))
 ONYX_HEALTH = "http://127.0.0.1:3000/api/health"
 SEARXNG_HEALTH = "http://127.0.0.1:8888/healthz"
+INDEX_STATE_FILE = DATA_ROOT / "index-state.json"
+BACKUP_DIR = DATA_ROOT / "backups"
+MAINTENANCE_LOCK = DATA_ROOT / "maintenance.lock"
+MAINTENANCE_SCRIPT = ROOT / "src" / "maintenance.py"
+INDEX_STALE_SECONDS = int(os.environ.get("KHUB_INDEX_STALE_SECONDS", str(2 * 60 * 60)))
+BACKUP_STALE_SECONDS = int(os.environ.get("KHUB_BACKUP_STALE_SECONDS", str(26 * 60 * 60)))
+MAINTENANCE_RETRY_SECONDS = int(
+    os.environ.get("KHUB_MAINTENANCE_RETRY_SECONDS", str(30 * 60))
+)
+_LAST_MAINTENANCE_DISPATCH = {"index": 0.0, "backup": 0.0}
+_MAINTENANCE_CHILDREN: list[subprocess.Popen] = []
 if platform.system() == "Darwin":
     os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -63,11 +75,138 @@ def healthy(url: str, timeout: int = 5) -> bool:
         return False
 
 
+def timestamp_status(timestamp: float, maximum_age: int, now: float) -> dict[str, object]:
+    age = max(0, int(now - timestamp)) if timestamp else None
+    return {
+        "ok": age is not None and age <= maximum_age,
+        "last_success_at": (
+            datetime.fromtimestamp(timestamp, timezone.utc).astimezone().isoformat()
+            if timestamp else None
+        ),
+        "age_seconds": age,
+        "maximum_age_seconds": maximum_age,
+    }
+
+
+def maintenance_freshness(now: float | None = None) -> dict[str, dict[str, object]]:
+    """Report index and backup freshness without opening the large SQLite DB."""
+    current = time.time() if now is None else now
+    try:
+        index_timestamp = INDEX_STATE_FILE.stat().st_mtime
+    except OSError:
+        index_timestamp = 0.0
+    backups = list(BACKUP_DIR.glob("knowledge-hub-critical-*.sqlite3.gz"))
+    backup_timestamp = max(
+        (path.stat().st_mtime for path in backups if path.is_file()), default=0.0
+    )
+    return {
+        "index": timestamp_status(index_timestamp, INDEX_STALE_SECONDS, current),
+        "backup": timestamp_status(backup_timestamp, BACKUP_STALE_SECONDS, current),
+    }
+
+
+def maintenance_busy() -> bool:
+    """Check the cross-platform maintenance lock without waiting for it."""
+    MAINTENANCE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = MAINTENANCE_LOCK.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def dispatch_maintenance(kind: str) -> None:
+    arguments = [sys.executable, str(MAINTENANCE_SCRIPT)]
+    if kind == "backup":
+        arguments.extend(["backup", "--mode", "critical", "--retain", "14"])
+    elif kind == "index":
+        arguments.append("ingest-all")
+    else:
+        raise ValueError(f"unknown maintenance kind: {kind}")
+    logs = DATA_ROOT / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    with (
+        (logs / f"{kind}.log").open("a", encoding="utf-8") as output,
+        (logs / f"{kind}.error.log").open("a", encoding="utf-8") as error,
+    ):
+        child = subprocess.Popen(
+            arguments,
+            stdout=output,
+            stderr=error,
+            close_fds=True,
+            start_new_session=os.name != "nt",
+        )
+    _MAINTENANCE_CHILDREN.append(child)
+
+
+def recover_stale_maintenance(now: float | None = None) -> dict[str, object]:
+    """Backstop unreliable OS schedules, launching at most one serialized job."""
+    current = time.time() if now is None else now
+    _MAINTENANCE_CHILDREN[:] = [
+        child for child in _MAINTENANCE_CHILDREN if child.poll() is None
+    ]
+    status = maintenance_freshness(current)
+    result: dict[str, object] = {"jobs": status, "busy": maintenance_busy()}
+    if result["busy"]:
+        return result
+    # Preserve durable state first. The next minute can dispatch indexing after
+    # the usually short critical backup releases the shared maintenance lock.
+    for kind in ("backup", "index"):
+        if status[kind]["ok"]:
+            continue
+        if current - _LAST_MAINTENANCE_DISPATCH[kind] < MAINTENANCE_RETRY_SECONDS:
+            continue
+        dispatch_maintenance(kind)
+        _LAST_MAINTENANCE_DISPATCH[kind] = current
+        result["dispatched"] = kind
+        break
+    return result
+
+
+def maintenance_log_summary(result: dict[str, object]) -> dict[str, object]:
+    jobs = result.get("jobs", {})
+    return {
+        "busy": bool(result.get("busy")),
+        "dispatched": result.get("dispatched"),
+        "jobs": {
+            name: {
+                "ok": value.get("ok"),
+                "last_success_at": value.get("last_success_at"),
+                "maximum_age_seconds": value.get("maximum_age_seconds"),
+            }
+            for name, value in jobs.items()
+        },
+    }
+
+
 def colima_running() -> bool:
     if not COLIMA.is_file():
         return False
     return subprocess.run(
         [str(COLIMA), "status"],
+        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=15,
@@ -79,6 +218,7 @@ def docker_running() -> bool:
         return False
     return subprocess.run(
         [str(DOCKER), "info"],
+        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=20,
@@ -279,6 +419,11 @@ def main() -> int:
     while True:
         try:
             result = ensure_services()
+            maintenance = (
+                {"jobs": maintenance_freshness(), "busy": maintenance_busy()}
+                if args.once else recover_stale_maintenance()
+            )
+            result["maintenance"] = maintenance_log_summary(maintenance)
             message = json.dumps(result, ensure_ascii=False, sort_keys=True)
             if message != last_message:
                 print(message, flush=True)

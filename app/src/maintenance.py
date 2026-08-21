@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import knowledge_hub as kh
-
+import start_services as service_watchdog
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = kh.DATA_ROOT / "backups"
@@ -313,6 +313,181 @@ def review_empty_projects(
     }
 
 
+def project_index_budget(db: sqlite3.Connection, project: dict[str, Any]) -> dict[str, Any]:
+    policy = kh.load_index_policy(project["slug"])
+    rows = db.execute(
+        "SELECT d.id,d.source_key,d.relative_path,d.modified_at,d.byte_size,COUNT(c.id) AS chunk_count,"
+        "COALESCE(SUM(length(c.content)),0) AS content_bytes "
+        "FROM documents d LEFT JOIN chunks c ON c.document_id=d.id "
+        "WHERE d.project_id=? AND d.source_type='file' GROUP BY d.id",
+        (project["id"],),
+    ).fetchall()
+    ordered = kh.fair_index_order(list(rows))
+    kept_documents = 0
+    kept_chunks = 0
+    removals: list[sqlite3.Row] = []
+    for row in ordered:
+        chunk_count = int(row["chunk_count"])
+        can_keep = (
+            not kh.index_path_excluded(row["relative_path"] or "", policy)
+            and kept_documents < policy["max_documents"]
+            and chunk_count <= policy["max_chunks_per_document"]
+            and kept_chunks + chunk_count <= policy["max_chunks"]
+        )
+        if can_keep:
+            kept_documents += 1
+            kept_chunks += chunk_count
+        else:
+            removals.append(row)
+    return {
+        "project_id": project["id"],
+        "project": project["slug"],
+        "display_name": project["display_name"],
+        "policy": {
+            key: policy[key]
+            for key in ("max_documents", "max_chunks", "max_chunks_per_document")
+        },
+        "documents": len(rows),
+        "chunks": sum(int(row["chunk_count"]) for row in rows),
+        "keep_documents": kept_documents,
+        "keep_chunks": kept_chunks,
+        "remove_documents": len(removals),
+        "remove_chunks": sum(int(row["chunk_count"]) for row in removals),
+        "reclaimable_content_bytes": sum(int(row["content_bytes"]) for row in removals),
+        "rebuildable_source_bytes": sum(int(row["byte_size"]) for row in removals),
+        "sample_removals": [row["relative_path"] for row in removals[:20]],
+        "_remove_ids": [row["id"] for row in removals],
+    }
+
+
+def review_index_budgets(
+    apply: bool = False,
+    project_slugs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Preview or explicitly prune rebuildable file indexes above policy limits."""
+    requested = list(dict.fromkeys(project_slugs or []))
+    if apply and not requested:
+        raise ValueError("应用索引清理时必须至少指定一个 --project")
+    db = kh.connect()
+    kh.initialize(db)
+    projects = kh.list_projects(db)
+    by_slug = {project["slug"]: project for project in projects}
+    missing = [slug for slug in requested if slug not in by_slug]
+    if missing:
+        db.close()
+        raise ValueError(f"项目不存在：{', '.join(missing)}")
+    selected = [by_slug[slug] for slug in requested] if requested else projects
+    reviews = [project_index_budget(db, project) for project in selected]
+    candidates = [item for item in reviews if item["remove_documents"] > 0]
+    backup_result: dict[str, Any] | None = None
+    removed_documents = 0
+    removed_chunks = 0
+    if apply and candidates:
+        backup_result = backup(retain=14, mode="critical")
+        for item in candidates:
+            ids = item["_remove_ids"]
+            for start in range(0, len(ids), 250):
+                batch = ids[start:start + 250]
+                db.executemany("DELETE FROM documents WHERE id=?", ((value,) for value in batch))
+                db.commit()
+            removed_documents += item["remove_documents"]
+            removed_chunks += item["remove_chunks"]
+            kh.audit(
+                db,
+                "index.budget_pruned",
+                item["project_id"],
+                {
+                    "documents": item["remove_documents"],
+                    "chunks": item["remove_chunks"],
+                    "policy": item["policy"],
+                },
+            )
+            db.commit()
+        state = load_index_state()
+        for item in candidates:
+            state["projects"].pop(item["project_id"], None)
+        save_index_state(state)
+    database_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    db.close()
+    checkpoint = (
+        checkpoint_database(database_path, truncate=False)
+        if apply and candidates
+        else None
+    )
+    public_reviews = [
+        {key: value for key, value in item.items() if not key.startswith("_")}
+        for item in reviews
+    ]
+    return {
+        "applied": apply,
+        "requested_projects": requested,
+        "projects_reviewed": len(reviews),
+        "projects_over_budget": len(candidates),
+        "remove_documents": sum(item["remove_documents"] for item in candidates),
+        "remove_chunks": sum(item["remove_chunks"] for item in candidates),
+        "reclaimable_content_bytes": sum(
+            item["reclaimable_content_bytes"] for item in candidates
+        ),
+        "removed_documents": removed_documents,
+        "removed_chunks": removed_chunks,
+        "backup": backup_result,
+        "checkpoint": checkpoint,
+        "vacuum_required_for_file_shrink": bool(apply and candidates),
+        "projects": public_reviews,
+    }
+
+
+def compact_index(
+    apply: bool = False,
+    clients_stopped: bool = False,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Preview or safely VACUUM the rebuildable index after explicit confirmation."""
+    path = (db_path or kh.DEFAULT_DB).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"数据库不存在：{path}")
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    page_size = int(probe.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(probe.execute("PRAGMA page_count").fetchone()[0])
+    free_pages = int(probe.execute("PRAGMA freelist_count").fetchone()[0])
+    probe.close()
+    before = path.stat().st_size
+    available = shutil.disk_usage(path.parent).free
+    required_free = before + 512 * 1024 * 1024
+    result: dict[str, Any] = {
+        "applied": apply,
+        "database": str(path),
+        "bytes_before": before,
+        "page_bytes": page_size * page_count,
+        "freelist_bytes": page_size * free_pages,
+        "available_disk_bytes": available,
+        "required_free_disk_bytes": required_free,
+        "clients_stopped_required": True,
+    }
+    if not apply:
+        return result
+    if not clients_stopped:
+        raise ValueError("执行压缩前必须退出 Codex、Antigravity 和 Antigravity IDE，并传入 --confirm-clients-stopped")
+    if available < required_free:
+        raise ValueError("可用磁盘空间不足，无法安全执行 SQLite VACUUM")
+    result["backup"] = backup(retain=14, mode="critical")
+    result["checkpoint"] = checkpoint_database(path, truncate=True, busy_timeout_ms=10_000)
+    db = sqlite3.connect(path, timeout=10)
+    try:
+        db.execute("PRAGMA busy_timeout=10000")
+        db.execute("VACUUM")
+        integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+    finally:
+        db.close()
+    after = path.stat().st_size
+    result.update({
+        "bytes_after": after,
+        "reclaimed_bytes": max(0, before - after),
+        "integrity": integrity,
+    })
+    return result
+
+
 def lock():
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.parent.chmod(0o700)
@@ -451,9 +626,8 @@ def verify_backup(source: Path, target: Path | None = None) -> dict:
     if expected and actual != expected:
         raise RuntimeError("备份 SHA-256 不匹配")
     if target is None:
-        temp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
-        temp.close()
-        target = Path(temp.name)
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as temp:
+            target = Path(temp.name)
         target.chmod(0o600)
         remove_target = True
     else:
@@ -660,8 +834,13 @@ def ingest_all(force: bool = False) -> dict:
 
 def health() -> dict:
     db = kh.connect()
-    kh.initialize(db)
-    integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+    try:
+        kh.initialize(db)
+        db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        database = "ok"
+        current_status = kh.status(db)
+    finally:
+        db.close()
     services = {}
     for name, url in {"onyx": "http://127.0.0.1:3000/api/health", "searxng": "http://127.0.0.1:8888/healthz"}.items():
         try:
@@ -669,7 +848,33 @@ def health() -> dict:
                 services[name] = {"ok": response.status == 200, "status": response.status}
         except Exception as exc:
             services[name] = {"ok": False, "error": str(exc)}
-    return {"database": integrity, "services": services, "status": kh.status(db)}
+    maintenance = service_watchdog.maintenance_freshness()
+    healthy = (
+        database == "ok"
+        and all(item["ok"] for item in services.values())
+        and all(item["ok"] for item in maintenance.values())
+    )
+    status_summary = {
+        "project_count": len(current_status["projects"]),
+        "collection_count": len(current_status["collections"]),
+        "global_scope_count": len(current_status["global_scopes"]),
+        "over_budget_projects": [
+            project["slug"]
+            for project in current_status["projects"]
+            if project.get("index_over_budget")
+        ],
+        "project_health": current_status["project_health"],
+        "memory_status": current_status["memory_status"],
+        "memory_quality": current_status["memory_quality"],
+        "memory_embeddings": current_status["memory_embeddings"],
+    }
+    return {
+        "ok": healthy,
+        "database": database,
+        "services": services,
+        "maintenance": maintenance,
+        "status": status_summary,
+    }
 
 
 def main() -> int:
@@ -697,6 +902,12 @@ def main() -> int:
     project_review.add_argument("--project", action="append", default=[])
     project_review.add_argument("--allow-existing-zero-docs", action="store_true")
     project_review.add_argument("--apply", action="store_true")
+    index_review = sub.add_parser("index-budget-review")
+    index_review.add_argument("--project", action="append", default=[])
+    index_review.add_argument("--apply", action="store_true")
+    compact = sub.add_parser("compact-index")
+    compact.add_argument("--apply", action="store_true")
+    compact.add_argument("--confirm-clients-stopped", action="store_true")
     sub.add_parser("health")
     sub.add_parser("memory-maintain")
     sub.add_parser("memory-embed")
@@ -725,6 +936,10 @@ def main() -> int:
             args.minimum_age_days,
             args.allow_existing_zero_docs,
         )
+    elif args.command == "index-budget-review":
+        value = review_index_budgets(args.apply, args.project)
+    elif args.command == "compact-index":
+        value = compact_index(args.apply, args.confirm_clients_stopped)
     elif args.command == "memory-maintain":
         db = kh.connect()
         kh.initialize(db)
@@ -739,7 +954,7 @@ def main() -> int:
         value = health()
     print(json.dumps(value, ensure_ascii=False, indent=2))
     handle.close()
-    return 0
+    return 0 if args.command != "health" or value.get("ok") else 1
 
 
 if __name__ == "__main__":

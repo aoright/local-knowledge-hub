@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fnmatch
 import hashlib
 import ipaddress
 import json
 import os
 import re
-import shutil
 import shlex
+import shutil
 import socket
-import ssl
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -34,10 +35,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(os.environ.get("KHUB_DATA_DIR", ROOT / "runtime")).expanduser().resolve()
 DEFAULT_DB = DATA_ROOT / "knowledge-hub.sqlite3"
+INDEX_POLICY_FILE = DATA_ROOT / "config" / "index-policy.json"
 EMBEDDING_CACHE = DATA_ROOT / "models"
 EMBEDDING_MODEL = os.environ.get(
     "KHUB_EMBEDDING_MODEL",
@@ -61,6 +62,29 @@ MAX_PDF_PAGES = int(os.environ.get("KHUB_MAX_PDF_PAGES", "200"))
 MAX_PDF_TEXT_CHARS = int(os.environ.get("KHUB_MAX_PDF_TEXT_CHARS", "500000"))
 CHUNK_CHARS = 1_600
 CHUNK_OVERLAP = 240
+INGEST_COMMIT_FILES = max(1, int(os.environ.get("KHUB_INGEST_COMMIT_FILES", "25")))
+INGEST_COMMIT_CHUNKS = max(
+    1, int(os.environ.get("KHUB_INGEST_COMMIT_CHUNKS", "5000"))
+)
+DEFAULT_INDEX_POLICY: dict[str, Any] = {
+    "max_documents": 25_000,
+    "max_chunks": 300_000,
+    "max_chunks_per_document": 4_096,
+    "exclude_globs": [
+        "**/*.min.css",
+        "**/*.min.js",
+        "**/*.map",
+        "**/*-lock.json",
+        "**/*_snapshot.json",
+        "**/.turbo/**",
+        "**/_generated/**",
+        "**/Cargo.lock",
+        "**/go.sum",
+        "**/package-lock.json",
+        "**/pnpm-lock.yaml",
+        "**/yarn.lock",
+    ],
+}
 
 TEXT_EXTENSIONS = {
     ".c", ".cc", ".conf", ".cpp", ".css", ".csv", ".dockerfile",
@@ -72,7 +96,8 @@ TEXT_EXTENSIONS = {
     ".xml", ".yaml", ".yml",
 }
 SKIP_DIRS = {
-    ".git", ".hg", ".idea", ".next", ".svn", ".venv", ".vscode",
+    ".cache", ".git", ".hg", ".idea", ".mypy_cache", ".next",
+    ".pytest_cache", ".ruff_cache", ".svn", ".tox", ".venv", ".vscode",
     "__pycache__", "build", "coverage", "dist", "node_modules", "target",
     "vendor",
 }
@@ -110,6 +135,10 @@ MCP_INSTRUCTIONS = (
     "通常设为 auto。任务请求本身、界面微调、问题描述、临时缺陷、助手实现结果和代码中已有事实不算用户长期记忆。"
     "全局范围只能由用户原句中的‘所有项目/跨项目/全局规范’等明确声明决定，绝不能根据助手生成的标题或摘要推断；"
     "未明确范围时写入当前项目。不要保存普通聊天、推测、临时调试、秘密或项目文件中已有事实。用户纠正、撤销、"
+    "调用 knowledge_capture 前必须一次性提供 title、content、kind、用户本轮原句 evidence、scope=auto 和 "
+    "source_type=user_statement；项目任务还要提供当前绝对 workspace_path，明确全局信息可省略。字段不全时不要调用，"
+    "不得猜测证据或工作区，validation_rejected 后不得改写"
+    "用户原话重试。"
     "提升或降级记忆时，自动使用 knowledge_update、knowledge_forget 或 knowledge_move。knowledge_context 返回的"
     "candidate_memories 只是旧会话候选，不得当作已生效事实；仅在与当前任务直接相关时向用户简短核实，用户确认后"
     "再用 knowledge_update 激活。始终保持项目隔离。"
@@ -203,6 +232,103 @@ def utcnow() -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def load_index_policy(project_slug: str) -> dict[str, Any]:
+    """Load bounded, user-overridable indexing limits for one project."""
+    stored: dict[str, Any] = {}
+    if INDEX_POLICY_FILE.is_file():
+        try:
+            value = json.loads(INDEX_POLICY_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"索引策略配置无效：{INDEX_POLICY_FILE}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("索引策略配置必须是 JSON 对象")
+        stored = value
+    defaults = stored.get("defaults", {})
+    projects = stored.get("projects", {})
+    override = projects.get(project_slug, {}) if isinstance(projects, dict) else {}
+    if not isinstance(defaults, dict) or not isinstance(override, dict):
+        raise TypeError("索引策略 defaults/projects 配置无效")
+    policy = {**DEFAULT_INDEX_POLICY, **defaults, **override}
+    for key in ("max_documents", "max_chunks", "max_chunks_per_document"):
+        try:
+            policy[key] = int(policy[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"索引策略 {key} 必须是正整数") from exc
+        if policy[key] < 1:
+            raise ValueError(f"索引策略 {key} 必须是正整数")
+    base_globs = [] if policy.get("replace_exclude_globs") else list(
+        DEFAULT_INDEX_POLICY["exclude_globs"]
+    )
+    configured_globs = policy.get("exclude_globs", [])
+    if not isinstance(configured_globs, list) or not all(
+        isinstance(item, str) for item in configured_globs
+    ):
+        raise ValueError("索引策略 exclude_globs 必须是字符串数组")
+    policy["exclude_globs"] = list(dict.fromkeys([*base_globs, *configured_globs]))
+    return policy
+
+
+def index_path_excluded(relative_path: str, policy: dict[str, Any]) -> bool:
+    return any(
+        fnmatch.fnmatch(relative_path, pattern)
+        or fnmatch.fnmatch(f"./{relative_path}", pattern)
+        for pattern in policy["exclude_globs"]
+    )
+
+
+IMPORTANT_INDEX_NAMES = {
+    "agents.md", "cargo.toml", "dockerfile", "go.mod", "license",
+    "makefile", "package.json", "pyproject.toml", "readme", "readme.md",
+    "requirements.txt",
+}
+
+
+def index_document_priority(relative_path: str, modified_at: str | float) -> tuple[Any, ...]:
+    """Keep manifests and recent files first when a project exceeds its budget."""
+    path = Path(relative_path)
+    name = path.name.casefold()
+    important = 0 if name in IMPORTANT_INDEX_NAMES or name.startswith("readme.") else 1
+    try:
+        timestamp = (
+            float(modified_at)
+            if isinstance(modified_at, (float, int))
+            else datetime.fromisoformat(modified_at).timestamp()
+        )
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    return (important, -timestamp, len(path.parts), relative_path.casefold())
+
+
+def fair_index_order(items: list[Any], path_key: str = "relative_path") -> list[Any]:
+    """Round-robin top-level areas so one large nested repository cannot dominate."""
+    groups: dict[str, list[Any]] = {}
+    for item in items:
+        relative_path = str(item[path_key] or "")
+        parts = Path(relative_path).parts
+        group = parts[0].casefold() if len(parts) > 1 else "__root__"
+        groups.setdefault(group, []).append(item)
+    for values in groups.values():
+        values.sort(
+            key=lambda item: index_document_priority(
+                str(item[path_key] or ""),
+                item.get("modified_at", "") if isinstance(item, dict) else item["modified_at"],
+            )
+        )
+    ordered: list[Any] = []
+    names = sorted(groups)
+    position = 0
+    while True:
+        added = False
+        for name in names:
+            values = groups[name]
+            if position < len(values):
+                ordered.append(values[position])
+                added = True
+        if not added:
+            return ordered
+        position += 1
 
 
 def stable_document_id(project_id: str, source_type: str, source_key: str) -> str:
@@ -721,6 +847,46 @@ def audit(db: sqlite3.Connection, action: str, project_id: str | None, details: 
         "INSERT INTO audit_log(event_at,action,project_id,details_json) VALUES(?,?,?,?)",
         (utcnow(), action, project_id, json.dumps(details, ensure_ascii=False, sort_keys=True)),
     )
+
+
+def telemetry_audit(
+    db: sqlite3.Connection,
+    action: str,
+    project_id: str | None,
+    details: dict[str, Any],
+    timeout_ms: int = 50,
+) -> bool:
+    """Write non-critical usage telemetry without blocking user-facing reads."""
+    database = str(db.execute("PRAGMA database_list").fetchone()[2])
+    if not database or database == ":memory:":
+        try:
+            audit(db, action, project_id, details)
+            db.commit()
+            return True
+        except sqlite3.Error:
+            db.rollback()
+            return False
+    telemetry = None
+    try:
+        telemetry = sqlite3.connect(
+            database, timeout=max(0.001, timeout_ms / 1000), isolation_level=None
+        )
+        telemetry.execute(f"PRAGMA busy_timeout={max(0, int(timeout_ms))}")
+        telemetry.execute(
+            "INSERT INTO audit_log(event_at,action,project_id,details_json) VALUES(?,?,?,?)",
+            (
+                utcnow(),
+                action,
+                project_id,
+                json.dumps(details, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        if telemetry is not None:
+            telemetry.close()
 
 
 def add_project(db: sqlite3.Connection, slug: str, display_name: str, path: str) -> dict[str, Any]:
@@ -1244,7 +1410,10 @@ def git_files(root: Path) -> list[Path] | None:
             ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             check=True, capture_output=True,
         ).stdout
-        return [root / os.fsdecode(item) for item in raw.split(b"\0") if item]
+        return sorted(
+            (root / os.fsdecode(item) for item in raw.split(b"\0") if item),
+            key=lambda path: path.as_posix().casefold(),
+        )
     except (OSError, subprocess.CalledProcessError):
         return None
 
@@ -1269,7 +1438,8 @@ def iter_files(root: Path, excluded_roots: set[Path] | None = None) -> Iterable[
             and not d.endswith("-backups")
             and not is_within(Path(current) / d, excluded_roots)
         ]
-        for name in files:
+        dirs.sort(key=str.casefold)
+        for name in sorted(files, key=str.casefold):
             yield Path(current) / name
 
 
@@ -1377,13 +1547,49 @@ class IngestStats:
     skipped: int = 0
     secret_redactions: int = 0
     chunks: int = 0
+    policy_limited: bool = False
+    policy_reason: str | None = None
+    policy_skipped: int = 0
+    truncated_documents: int = 0
+    selected_documents: int = 0
+    selected_chunks: int = 0
+    max_documents: int = 0
+    max_chunks: int = 0
 
 
 def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
     project = get_project(db, project_ref)
-    stats = IngestStats(project=project["slug"])
+    policy = load_index_policy(project["slug"])
+    stats = IngestStats(
+        project=project["slug"],
+        max_documents=policy["max_documents"],
+        max_chunks=policy["max_chunks"],
+    )
+    existing_documents = int(db.execute(
+        "SELECT COUNT(*) FROM documents WHERE project_id=? AND source_type='file'",
+        (project["id"],),
+    ).fetchone()[0])
+    existing_chunks = int(db.execute(
+        "SELECT COUNT(*) FROM chunks WHERE project_id=? AND document_id IN "
+        "(SELECT id FROM documents WHERE project_id=? AND source_type='file')",
+        (project["id"], project["id"]),
+    ).fetchone()[0])
+    if (
+        existing_documents > policy["max_documents"]
+        or existing_chunks > policy["max_chunks"]
+    ):
+        stats.policy_limited = True
+        stats.policy_reason = "existing_index_exceeds_policy"
+        stats.policy_skipped = existing_documents
+        stats.selected_documents = existing_documents
+        stats.selected_chunks = existing_chunks
+        audit(db, "project.ingest", project["id"], asdict(stats))
+        db.commit()
+        return stats
+
     seen: set[str] = set()
     changed_since_commit = 0
+    chunks_since_commit = 0
     own_roots = {Path(value).resolve() for value in project["paths"]}
     all_other_roots = {
         Path(row["path"]).resolve()
@@ -1391,6 +1597,7 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
             "SELECT path FROM project_paths WHERE project_id<>? AND active=1", (project["id"],)
         )
     }
+    candidates: list[dict[str, Any]] = []
     for root_text in project["paths"]:
         root = Path(root_text)
         nested_roots = {
@@ -1419,12 +1626,72 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
                 stats.skipped += 1
                 continue
             rel = path.relative_to(root).as_posix()
+            suffix = path.suffix.lower()
+            if (
+                suffix != ".pdf"
+                and suffix not in TEXT_EXTENSIONS
+                and path.name not in {"Dockerfile", "Makefile", "LICENSE"}
+            ):
+                stats.skipped += 1
+                continue
+            if index_path_excluded(rel, policy):
+                stats.skipped += 1
+                continue
             source_key = f"{root.name}/{rel}"
             doc_id = stable_document_id(project["id"], "file", source_key)
-            seen.add(doc_id)
             modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
-            old = db.execute("SELECT content_hash,byte_size,modified_at FROM documents WHERE id=?", (doc_id,)).fetchone()
-            if old and old["byte_size"] == stat.st_size and old["modified_at"] == modified_at:
+            candidates.append({
+                "root_text": root_text,
+                "path": path,
+                "stat": stat,
+                "relative_path": rel,
+                "source_key": source_key,
+                "document_id": doc_id,
+                "modified_at": modified_at,
+            })
+
+    candidates = fair_index_order(candidates)
+    if len(candidates) > policy["max_documents"]:
+        stats.policy_limited = True
+        stats.policy_reason = "max_documents"
+        stats.policy_skipped += len(candidates) - policy["max_documents"]
+        candidates = candidates[: policy["max_documents"]]
+
+    existing = {
+        row["id"]: row
+        for row in db.execute(
+            "SELECT d.id,d.content_hash,d.byte_size,d.modified_at,COUNT(c.id) AS chunk_count "
+            "FROM documents d LEFT JOIN chunks c ON c.document_id=d.id "
+            "WHERE d.project_id=? AND d.source_type='file' GROUP BY d.id",
+            (project["id"],),
+        )
+    }
+    selected_chunks = 0
+    for position, candidate in enumerate(candidates):
+            remaining_chunks = policy["max_chunks"] - selected_chunks
+            if remaining_chunks <= 0:
+                stats.policy_limited = True
+                stats.policy_reason = stats.policy_reason or "max_chunks"
+                stats.policy_skipped += len(candidates) - position
+                break
+            path = candidate["path"]
+            stat = candidate["stat"]
+            rel = candidate["relative_path"]
+            doc_id = candidate["document_id"]
+            modified_at = candidate["modified_at"]
+            old = existing.get(doc_id)
+            allowed_chunks = min(
+                policy["max_chunks_per_document"], remaining_chunks
+            )
+            old_chunk_count = int(old["chunk_count"]) if old else 0
+            if (
+                old
+                and old["byte_size"] == stat.st_size
+                and old["modified_at"] == modified_at
+                and old_chunk_count <= allowed_chunks
+            ):
+                seen.add(doc_id)
+                selected_chunks += old_chunk_count
                 stats.unchanged += 1
                 continue
             text, extraction = extract_text(path)
@@ -1437,35 +1704,60 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
             text, redactions = redact_secrets(text)
             stats.secret_redactions += redactions
             content_hash = sha256_bytes(text.encode("utf-8"))
-            if old and old["content_hash"] == content_hash:
+            if (
+                old
+                and old["content_hash"] == content_hash
+                and old_chunk_count <= allowed_chunks
+            ):
                 db.execute("UPDATE documents SET byte_size=?,modified_at=? WHERE id=?", (stat.st_size, modified_at, doc_id))
+                seen.add(doc_id)
+                selected_chunks += old_chunk_count
                 stats.unchanged += 1
                 continue
             title = rel
             indexed_at = utcnow()
+            all_pieces = chunks(text)
+            pieces = all_pieces[:allowed_chunks]
+            if not pieces:
+                stats.skipped += 1
+                continue
+            if len(pieces) < len(all_pieces):
+                stats.policy_limited = True
+                stats.policy_reason = stats.policy_reason or "max_chunks"
+                stats.truncated_documents += 1
             db.execute(
                 "INSERT INTO documents(id,project_id,source_type,source_key,title,relative_path,source_uri,content_hash,byte_size,modified_at,indexed_at,metadata_json) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,relative_path=excluded.relative_path,source_uri=excluded.source_uri,content_hash=excluded.content_hash,byte_size=excluded.byte_size,modified_at=excluded.modified_at,indexed_at=excluded.indexed_at,metadata_json=excluded.metadata_json",
                 (
-                    doc_id, project["id"], "file", source_key, title, rel, path.as_uri(), content_hash,
+                    doc_id, project["id"], "file", candidate["source_key"], title, rel, path.as_uri(), content_hash,
                     stat.st_size, modified_at, indexed_at,
-                    json.dumps({"root": root_text, "extraction": extraction}, ensure_ascii=False),
+                    json.dumps({
+                        "root": candidate["root_text"],
+                        "extraction": extraction,
+                        "chunk_limit": allowed_chunks if len(pieces) < len(all_pieces) else None,
+                    }, ensure_ascii=False),
                 ),
             )
             db.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
-            pieces = chunks(text)
             for index, piece in enumerate(pieces):
                 db.execute(
                     "INSERT INTO chunks(document_id,project_id,chunk_index,title,relative_path,content) VALUES(?,?,?,?,?,?)",
                     (doc_id, project["id"], index, title, rel, piece),
                 )
+            seen.add(doc_id)
+            selected_chunks += len(pieces)
             stats.indexed += 1
             stats.chunks += len(pieces)
             changed_since_commit += 1
-            if changed_since_commit >= 250:
+            chunks_since_commit += len(pieces)
+            if (
+                changed_since_commit >= INGEST_COMMIT_FILES
+                or chunks_since_commit >= INGEST_COMMIT_CHUNKS
+            ):
                 db.commit()
                 db.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 changed_since_commit = 0
+                chunks_since_commit = 0
     rows = db.execute(
         "SELECT id FROM documents WHERE project_id=? AND source_type='file'", (project["id"],)
     ).fetchall()
@@ -1473,6 +1765,8 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
     for doc_id in stale:
         db.execute("DELETE FROM documents WHERE id=?", (doc_id,))
     stats.deleted = len(stale)
+    stats.selected_documents = len(seen)
+    stats.selected_chunks = selected_chunks
     audit(db, "project.ingest", project["id"], asdict(stats))
     db.commit()
     return stats
@@ -1508,7 +1802,7 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
         f"SELECT 1 FROM chunks WHERE project_id IN ({placeholders}) LIMIT 1",
         project_ids,
     ).fetchone():
-        audit(
+        telemetry_audit(
             db,
             "knowledge.search",
             scope["id"],
@@ -1519,7 +1813,6 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
                 "short_circuit": "empty_scope",
             },
         )
-        db.commit()
         return []
     rows = db.execute(
         f"""
@@ -1581,8 +1874,12 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
                 (*project_ids, *term_values, utcnow(), max(1, min(limit, 50))),
             ).fetchall()
             retrieval_method = "substring"
-    audit(db, "knowledge.search", scope["id"], {"scope_type": scope["type"], "query": query, "result_count": len(rows)})
-    db.commit()
+    telemetry_audit(
+        db,
+        "knowledge.search",
+        scope["id"],
+        {"scope_type": scope["type"], "query": query, "result_count": len(rows)},
+    )
     results = [dict(row) for row in rows]
     for item in results:
         item["retrieval_method"] = retrieval_method
@@ -2414,14 +2711,42 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
         row["project_id"]: row["chunks"]
         for row in db.execute("SELECT project_id,COUNT(*) chunks FROM chunks GROUP BY project_id")
     }
+    file_document_counts = {
+        row["project_id"]: row["docs"]
+        for row in db.execute(
+            "SELECT project_id,COUNT(*) docs FROM documents "
+            "WHERE source_type='file' GROUP BY project_id"
+        )
+    }
+    file_chunk_counts = {
+        row["project_id"]: row["chunks"]
+        for row in db.execute(
+            "SELECT d.project_id,COUNT(c.id) chunks FROM documents d "
+            "JOIN chunks c ON c.document_id=d.id WHERE d.source_type='file' "
+            "GROUP BY d.project_id"
+        )
+    }
     projects = []
     for project in list_projects(db):
         counts = document_counts.get(project["id"])
+        policy = load_index_policy(project["slug"])
+        documents = counts["docs"] if counts else 0
+        project_chunks = chunk_counts.get(project["id"], 0)
+        file_documents = file_document_counts.get(project["id"], 0)
+        file_chunks = file_chunk_counts.get(project["id"], 0)
         projects.append({
             **project,
-            "documents": counts["docs"] if counts else 0,
+            "documents": documents,
             "bytes": counts["bytes"] if counts else 0,
-            "chunks": chunk_counts.get(project["id"], 0),
+            "chunks": project_chunks,
+            "index_policy": {
+                key: policy[key]
+                for key in ("max_documents", "max_chunks", "max_chunks_per_document")
+            },
+            "index_over_budget": (
+                file_documents > policy["max_documents"]
+                or file_chunks > policy["max_chunks"]
+            ),
         })
     zero_document_projects = [
         {
@@ -2962,7 +3287,7 @@ def mcp_tools() -> list[dict[str, Any]]:
         {"name": "knowledge_context", "description": "默认自动上下文工具。处理项目任务前主动调用；必须传入当前 IDE 工作区或当前文件的绝对路径 workspace_path，不能只传 query。按项目优先组合少量全局知识，用户无需说出工具名。", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "project": {"type": "string", "description": "可选项目名、稳定 ID 或 collection:slug；仅用于覆盖 workspace_path 的自动识别"}, "workspace_path": {"type": "string", "minLength": 1, "description": "必填：当前 IDE 工作区或当前文件的绝对路径，禁止省略或只传 query"}, "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8}, "global_limit": {"type": "integer", "minimum": 0, "maximum": 10, "default": 4}, "include_global": {"type": "boolean", "default": True}}, "required": ["query", "workspace_path"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_search", "description": "严格在指定项目、全局分区或 collection 内搜索，不隐式扩大范围。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, "required": ["project", "query"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_remember", "description": "用户明确要求强制保存时使用；可写实际项目或 global-* 分区，按内容去重。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "confirmed": {"type": "boolean", "const": True}}, "required": ["project", "title", "content", "kind", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
-        {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户原句明确表达的长期 decision/fact/constraint/runbook。界面微调、问题描述、临时缺陷、普通任务请求、网页、推断、实现结果和项目文件中已有事实禁止写入。scope=auto 只依据用户原句判断；只有明确‘所有项目/跨项目/全局规范’才写全局。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句；服务端只依据此字段判断长期性与全局范围"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
+        {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户原句明确表达的长期 decision/fact/constraint/runbook。界面微调、问题描述、临时缺陷、普通任务请求、网页、推断、实现结果和项目文件中已有事实禁止写入。调用前一次性准备 title、content、kind、用户本轮原句 evidence、scope=auto 和 source_type=user_statement；项目任务还要提供当前绝对 workspace_path。字段不全时不要调用，validation_rejected 后不要改写用户原话重试。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string", "description": "项目任务必须提供当前 IDE 工作区或文件的绝对路径；明确全局信息可省略"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句；服务端只依据此字段判断长期性与全局范围"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_list", "description": "查看最近长期记忆或候选冲突；用户说‘查看记忆/最近记住了什么’时使用。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "status": {"type": "string", "enum": ["candidate", "active", "superseded", "deleted", "expired"], "default": "active"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_update", "description": "用户明确纠正记忆或确认候选冲突时使用；保留旧版本和证据，不静默覆盖。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "activate": {"type": "boolean", "default": True}, "supersedes_id": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "content", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
         {"name": "knowledge_forget", "description": "用户明确说某条记忆作废/不要记时使用；执行可审计软删除，不立即物理清除。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
@@ -3119,13 +3444,12 @@ def mcp_server(db_path: Path) -> None:
                         "version": str(raw_client.get("version", ""))[:80],
                     }
                 client_info.update(client_runtime_identity(client_info["name"]))
-                audit(
+                telemetry_audit(
                     db,
                     "mcp.initialize",
                     None,
                     {**client_info, "pid": os.getpid(), "transport": "stdio"},
                 )
-                db.commit()
                 result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "local-knowledge-hub", "version": "2.0.0"}, "instructions": MCP_INSTRUCTIONS}
             elif method == "tools/list":
                 result = {"tools": mcp_tools()}
@@ -3141,7 +3465,8 @@ def mcp_server(db_path: Path) -> None:
                         client_info.get("surface") or client_info.get("name"),
                     )
                 except Exception as exc:
-                    audit(
+                    db.rollback()
+                    telemetry_audit(
                         db,
                         "mcp.tool_call",
                         None,
@@ -3158,9 +3483,9 @@ def mcp_server(db_path: Path) -> None:
                             "duration_ms": round((time.monotonic() - started) * 1000),
                         },
                     )
-                    db.commit()
                     raise
-                audit(
+                db.commit()
+                telemetry_audit(
                     db,
                     "mcp.tool_call",
                     None,
@@ -3175,7 +3500,6 @@ def mcp_server(db_path: Path) -> None:
                         "duration_ms": round((time.monotonic() - started) * 1000),
                     },
                 )
-                db.commit()
                 if (
                     tool_name == "knowledge_context"
                     and isinstance(value, dict)

@@ -28,7 +28,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.3.0.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.3.1.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges. The **Enable automatic updates (recommended)** option is selected by
@@ -38,7 +38,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.3.0.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.3.1.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -72,6 +72,17 @@ Core-only installation without Onyx or SearXNG:
 The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
+
+Version 1.3.1 bounds each project to 25,000 documents and 300,000 chunks by
+default, keeps manifests and top-level areas fairly represented, and prevents an
+existing oversized index from growing until it is explicitly reviewed. Usage
+telemetry no longer blocks foreground retrieval behind indexing transactions,
+and indexing commits smaller batches. Index pruning and SQLite compaction are
+dry-run by default and require exact, explicit confirmation. Index and backup
+jobs run once at login as well as on their normal schedules, while the service
+watchdog repairs stale maintenance serially. Health checks use lightweight probes,
+and automatic memory capture requires one complete, evidence-backed argument set
+instead of retrying partial calls.
 
 Version 1.3.0 adds verified self-updates. A per-user daily task checks GitHub's
 stable latest Release, compares semantic versions, downloads only the asset for the
@@ -154,6 +165,7 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
 ## Automatic maintenance
 
 - Windows uses per-user Task Scheduler jobs for service health, 30-minute incremental indexing, daily backups, and daily verified updates.
+- The always-running service watchdog also checks index and critical-backup freshness once per minute. If the operating-system scheduler misses work, it serially dispatches a critical backup first and indexing next. Default stale thresholds are two hours for indexing and 26 hours for backups; `maintenance.py health` reports both without running a blocking full-database integrity scan.
 - Zero-document project review is non-destructive by default:
 
   ```bash
@@ -163,9 +175,10 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
   Existing project paths require both `--allow-existing-zero-docs` and an exact
   `--project <slug>` together with `--apply`. Only the knowledge-hub registration
   is removed; the local directory and its files are never touched.
-- macOS uses per-user LaunchAgents for the same jobs. Turning automatic updates off keeps the local job installed but makes it exit before any network request, so it can be re-enabled without reinstalling.
+- macOS uses per-user LaunchAgents for the same jobs. Index and backup agents also run once at login before their normal interval/calendar schedules. Turning automatic updates off keeps the local job installed but makes it exit before any network request, so it can be re-enabled without reinstalling.
 - Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
 - Git projects—and collection folders containing multiple Git repositories—use content-sensitive working-tree fingerprints, so unchanged projects avoid repeated full file walks. A full verification scan still runs at least once every 24 hours.
+- Project index budgets default to 25,000 documents, 300,000 chunks, and 4,096 chunks per document. Review them with `python app/src/maintenance.py index-budget-review`. Applying a review requires both an exact `--project <slug>` and `--apply`; a critical backup is created first and project source files are never deleted. Run `compact-index` for a dry-run disk-space check. Actual compaction additionally requires `--apply --confirm-clients-stopped` after all three clients are closed.
 - Daily scheduled backups preserve project registration, collections, long-term memories, history, embeddings, and audit records while omitting rebuildable file indexes and web caches. Existing full backups are retained separately; `maintenance.py backup --mode full` remains available for manual snapshots.
 - MCP initialization and tool calls are recorded locally with client name, success state, and duration. Tool arguments and project contents are not written to the usage audit.
 - Codex automation rules are stored in `~/.codex/AGENTS.md`; Antigravity rules are stored in the official `~/.gemini/GEMINI.md` location. Older managed Antigravity rules are migrated without removing unrelated user instructions.

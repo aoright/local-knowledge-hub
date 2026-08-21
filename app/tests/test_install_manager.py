@@ -3,11 +3,11 @@ import json
 import os
 import plistlib
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import tomllib
 
 MODULE_PATH = Path(__file__).parents[1] / "src" / "install_manager.py"
 SPEC = importlib.util.spec_from_file_location("install_manager", MODULE_PATH)
@@ -29,6 +29,8 @@ class InstallManagerTests(unittest.TestCase):
         self.assertNotIn(manager.MANAGED_BEGIN, removed)
         self.assertIn("do not wait for the user", manager.INSTRUCTIONS)
         self.assertIn("call `knowledge_capture` automatically", manager.INSTRUCTIONS)
+        self.assertIn("one complete argument object", manager.INSTRUCTIONS)
+        self.assertIn("do not retry a `validation_rejected`", manager.INSTRUCTIONS)
         self.assertIn("`workspace_path` is mandatory", manager.INSTRUCTIONS)
         self.assertIn("never call it with only `query`", manager.INSTRUCTIONS)
 
@@ -171,6 +173,19 @@ class InstallManagerTests(unittest.TestCase):
             self.assertEqual(
                 payload["StartCalendarInterval"], {"Hour": 4, "Minute": 15}
             )
+            index_agent = (
+                home / "Library" / "LaunchAgents" /
+                f"{manager.LABELS['index']}.plist"
+            )
+            index_payload = plistlib.loads(index_agent.read_bytes())
+            self.assertTrue(index_payload["RunAtLoad"])
+            self.assertEqual(index_payload["StartInterval"], 1800)
+            backup_agent = (
+                home / "Library" / "LaunchAgents" /
+                f"{manager.LABELS['backup']}.plist"
+            )
+            backup_payload = plistlib.loads(backup_agent.read_bytes())
+            self.assertTrue(backup_payload["RunAtLoad"])
 
     def test_windows_initialize_writes_native_wrappers_and_mcp_launch(self):
         with tempfile.TemporaryDirectory() as value:

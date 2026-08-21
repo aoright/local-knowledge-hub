@@ -9,13 +9,11 @@ import os
 import plistlib
 import re
 import secrets
-import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
 
 MANAGED_BEGIN = "<!-- local-knowledge-hub:begin -->"
 MANAGED_END = "<!-- local-knowledge-hub:end -->"
@@ -25,6 +23,7 @@ INSTRUCTIONS = """# Shared local knowledge automation
 - `workspace_path` is mandatory for `knowledge_context`: always pass the current IDE workspace or current file absolute path and a concise task-specific query; never call it with only `query`. Add `project` only to override workspace resolution. Keep `include_global=true` so the server combines the current project with a small, relevant global context. Ask which project only if resolution is ambiguous. Do not call it for ordinary conversation unrelated to project work.
 - For current or external information, call `web_search` automatically and use `web_fetch` on the most relevant primary sources.
 - Before the final response, proactively review the current user's own messages; do not wait for the user to say “remember this.” If and only if the user explicitly authored a durable decision, fact, constraint, or runbook, call `knowledge_capture` automatically with `scope=auto` and preserve the user's statement as evidence. A task request, UI tweak, question, transient defect, assistant implementation result, or fact already represented by project files is not a memory. Determine global scope only from the user's evidence: it must explicitly say all projects, cross-project, or global policy; never infer scope from an assistant-generated title or summary. Otherwise keep it in the current project. Never capture ordinary chat, guesses, transient debugging, secrets, or web claims.
+- Before calling `knowledge_capture`, build one complete argument object with `title`, `content`, `kind`, and the user's exact current-turn sentence in `evidence`; pass `scope=auto` and `source_type=user_statement`, plus the current absolute `workspace_path` for a project task. Explicitly global information may omit the workspace. Do not call with partial arguments, do not guess missing evidence or workspace, and do not retry a `validation_rejected` result by paraphrasing the user's words.
 - When the user corrects, revokes, promotes, or demotes a memory, use `knowledge_update`, `knowledge_forget`, or `knowledge_move` automatically and preserve the user's evidence.
 - Keep project retrieval isolated. Search collections only when cross-project scope is explicit; global retrieval is a small read-only supplement, not an all-project search.
 """
@@ -399,12 +398,15 @@ def install_launch_agents(home: Path, install_root: Path, services: bool) -> lis
     definitions = {
         "index": plist_payload(
             LABELS["index"], [python, str(app / "maintenance.py"), "ingest-all"],
-            install_root, {"StartInterval": 1800},
+            install_root, {"RunAtLoad": True, "StartInterval": 1800},
         ),
         "backup": plist_payload(
             LABELS["backup"],
             [python, str(app / "maintenance.py"), "backup", "--mode", "critical", "--retain", "14"],
-            install_root, {"StartCalendarInterval": {"Hour": 3, "Minute": 15}},
+            install_root, {
+                "RunAtLoad": True,
+                "StartCalendarInterval": {"Hour": 3, "Minute": 15},
+            },
         ),
         "update": plist_payload(
             LABELS["update"], [python, str(app / "update_manager.py"), "auto"],
