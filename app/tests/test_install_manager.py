@@ -33,6 +33,8 @@ class InstallManagerTests(unittest.TestCase):
         self.assertIn("do not retry a `validation_rejected`", manager.INSTRUCTIONS)
         self.assertIn("`workspace_path` is mandatory", manager.INSTRUCTIONS)
         self.assertIn("never call it with only `query`", manager.INSTRUCTIONS)
+        self.assertIn("resolve one exact `memory_id`", manager.INSTRUCTIONS)
+        self.assertIn("do not retry `missing_argument`", manager.INSTRUCTIONS)
 
     def test_antigravity_rule_uses_official_global_gemini_file(self):
         with tempfile.TemporaryDirectory() as value:
@@ -173,6 +175,7 @@ class InstallManagerTests(unittest.TestCase):
             self.assertEqual(
                 payload["StartCalendarInterval"], {"Hour": 4, "Minute": 15}
             )
+            self.assertTrue(payload["RunAtLoad"])
             index_agent = (
                 home / "Library" / "LaunchAgents" /
                 f"{manager.LABELS['index']}.plist"

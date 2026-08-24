@@ -24,7 +24,7 @@ INSTRUCTIONS = """# Shared local knowledge automation
 - For current or external information, call `web_search` automatically and use `web_fetch` on the most relevant primary sources.
 - Before the final response, proactively review the current user's own messages; do not wait for the user to say “remember this.” If and only if the user explicitly authored a durable decision, fact, constraint, or runbook, call `knowledge_capture` automatically with `scope=auto` and preserve the user's statement as evidence. A task request, UI tweak, question, transient defect, assistant implementation result, or fact already represented by project files is not a memory. Determine global scope only from the user's evidence: it must explicitly say all projects, cross-project, or global policy; never infer scope from an assistant-generated title or summary. Otherwise keep it in the current project. Never capture ordinary chat, guesses, transient debugging, secrets, or web claims.
 - Before calling `knowledge_capture`, build one complete argument object with `title`, `content`, `kind`, and the user's exact current-turn sentence in `evidence`; pass `scope=auto` and `source_type=user_statement`, plus the current absolute `workspace_path` for a project task. Explicitly global information may omit the workspace. Do not call with partial arguments, do not guess missing evidence or workspace, and do not retry a `validation_rejected` result by paraphrasing the user's words.
-- When the user corrects, revokes, promotes, or demotes a memory, use `knowledge_update`, `knowledge_forget`, or `knowledge_move` automatically and preserve the user's evidence.
+- When the user corrects, revokes, promotes, or demotes a memory, first resolve one exact `memory_id` with `knowledge_list` or `knowledge_explain`, then call `knowledge_update`, `knowledge_forget`, or `knowledge_move` with one complete argument object and the user's exact evidence. Update requires `memory_id`, `content`, `reason`, `evidence`, and `confirmed=true`; forget requires `memory_id`, `reason`, `evidence`, and `confirmed=true`; move requires `memory_id`, `target_scope`, `reason`, `evidence`, and `confirmed=true`. Never guess missing fields, and do not retry `missing_argument` or `validation_rejected` by paraphrasing the user's words.
 - Keep project retrieval isolated. Search collections only when cross-project scope is explicit; global retrieval is a small read-only supplement, not an all-project search.
 """
 LABELS = {
@@ -410,7 +410,10 @@ def install_launch_agents(home: Path, install_root: Path, services: bool) -> lis
         ),
         "update": plist_payload(
             LABELS["update"], [python, str(app / "update_manager.py"), "auto"],
-            install_root, {"StartCalendarInterval": {"Hour": 4, "Minute": 15}},
+            install_root, {
+                "RunAtLoad": True,
+                "StartCalendarInterval": {"Hour": 4, "Minute": 15},
+            },
         ),
     }
     if services:

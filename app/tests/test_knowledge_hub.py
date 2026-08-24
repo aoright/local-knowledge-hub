@@ -251,6 +251,12 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIn("knowledge_update", [tool["name"] for tool in tools])
         self.assertIn("knowledge_forget", [tool["name"] for tool in tools])
         self.assertIn("knowledge_move", [tool["name"] for tool in tools])
+        update_tool = next(tool for tool in tools if tool["name"] == "knowledge_update")
+        self.assertIn("一次性提交全部必填参数", update_tool["description"])
+        self.assertIn("不要猜测", update_tool["description"])
+        self.assertEqual(
+            update_tool["inputSchema"]["properties"]["memory_id"]["minLength"], 1
+        )
 
     def test_mcp_stdio_is_utf8_and_ignores_blank_frames(self):
         db_path = Path(self.tmp.name) / "mcp.sqlite3"
@@ -699,6 +705,27 @@ class KnowledgeHubTests(unittest.TestCase):
         )
         self.assertEqual(details["short_circuit"], "empty_scope")
 
+    def test_global_aggregate_is_not_reported_as_user_collection(self):
+        kh.remember(
+            self.db,
+            "global-engineering",
+            "Global telemetry rule",
+            "global-telemetry-marker",
+            "constraint",
+        )
+        results = kh.search(
+            self.db, f"collection:{kh.GLOBAL_COLLECTION_SLUG}", "global-telemetry-marker"
+        )
+        self.assertEqual(len(results), 1)
+        details = json.loads(
+            self.db.execute(
+                "SELECT details_json FROM audit_log WHERE action='knowledge.search' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertEqual(details["scope_type"], "global")
+        self.assertEqual(details["scope_slug"], kh.GLOBAL_COLLECTION_SLUG)
+
     def test_semantic_search_skips_embedding_when_scope_has_no_memories(self):
         project_id = kh.get_project(self.db, "alpha")["id"]
         with mock.patch.object(kh, "embed_query", side_effect=AssertionError("embedding should not run")):
@@ -729,7 +756,7 @@ class KnowledgeHubTests(unittest.TestCase):
                 "decision",
             )
         self.db.execute(
-            "INSERT INTO memory_embeddings(document_id,model,dimensions,embedding,content_hash,updated_at) "
+            "INSERT OR REPLACE INTO memory_embeddings(document_id,model,dimensions,embedding,content_hash,updated_at) "
             "VALUES(?,?,?,?,?,?)",
             (
                 memory["document_id"],
@@ -742,7 +769,9 @@ class KnowledgeHubTests(unittest.TestCase):
         )
         self.db.commit()
         original_instance = kh._EMBEDDING_MODEL_INSTANCE
+        original_ready = kh._EMBEDDING_MODEL_READY.is_set()
         kh._EMBEDDING_MODEL_INSTANCE = None
+        kh._EMBEDDING_MODEL_READY.clear()
         try:
             with mock.patch.object(
                 kh, "embed_query", side_effect=AssertionError("cold embedding should not run")
@@ -752,6 +781,44 @@ class KnowledgeHubTests(unittest.TestCase):
                 )
         finally:
             kh._EMBEDDING_MODEL_INSTANCE = original_instance
+            if original_ready:
+                kh._EMBEDDING_MODEL_READY.set()
+            else:
+                kh._EMBEDDING_MODEL_READY.clear()
+        self.assertEqual(context["semantic_mode"], "lexical_fast_path")
+
+    def test_context_stays_lexical_until_first_embedding_inference_finishes(self):
+        memory = kh.remember(
+            self.db, "alpha", "Warmup race", "warmup-race-marker", "constraint"
+        )
+        self.db.execute(
+            "INSERT OR REPLACE INTO memory_embeddings(document_id,model,dimensions,embedding,content_hash,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                memory["document_id"],
+                kh.EMBEDDING_MODEL,
+                kh.EMBEDDING_DIMENSIONS,
+                b"not-read-before-ready",
+                "race-test-hash",
+                kh.utcnow(),
+            ),
+        )
+        self.db.commit()
+        original_instance = kh._EMBEDDING_MODEL_INSTANCE
+        original_ready = kh._EMBEDDING_MODEL_READY.is_set()
+        kh._EMBEDDING_MODEL_INSTANCE = object()
+        kh._EMBEDDING_MODEL_READY.clear()
+        try:
+            with mock.patch.object(
+                kh, "embed_query", side_effect=AssertionError("first inference is still warming")
+            ):
+                context = kh.context_search(self.db, "alpha", "unrelated query", 8, 4, True)
+        finally:
+            kh._EMBEDDING_MODEL_INSTANCE = original_instance
+            if original_ready:
+                kh._EMBEDDING_MODEL_READY.set()
+            else:
+                kh._EMBEDDING_MODEL_READY.clear()
         self.assertEqual(context["semantic_mode"], "lexical_fast_path")
 
     def test_initialize_migrates_legacy_fts_to_project_partition(self):

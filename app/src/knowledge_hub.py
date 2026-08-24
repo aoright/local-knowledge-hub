@@ -50,6 +50,7 @@ _EMBEDDING_MODEL_INSTANCE: Any | None = None
 _EMBEDDING_MODEL_ERROR: str | None = None
 _EMBEDDING_WARM_THREAD: threading.Thread | None = None
 _EMBEDDING_WARM_LOCK = threading.Lock()
+_EMBEDDING_MODEL_READY = threading.Event()
 LEGACY_CONVERSATION_RUNTIME = Path(
     os.environ.get(
         "KHUB_LEGACY_CONVERSATION_RUNTIME",
@@ -139,7 +140,11 @@ MCP_INSTRUCTIONS = (
     "source_type=user_statement；项目任务还要提供当前绝对 workspace_path，明确全局信息可省略。字段不全时不要调用，"
     "不得猜测证据或工作区，validation_rejected 后不得改写"
     "用户原话重试。"
-    "提升或降级记忆时，自动使用 knowledge_update、knowledge_forget 或 knowledge_move。knowledge_context 返回的"
+    "提升或降级记忆时，自动使用 knowledge_update、knowledge_forget 或 knowledge_move。调用前先通过 knowledge_list "
+    "或 knowledge_explain 确认唯一 memory_id，并一次性提供完整参数：update 需要 memory_id、content、reason、evidence、"
+    "confirmed=true；forget 需要 memory_id、reason、evidence、confirmed=true；move 需要 memory_id、target_scope、reason、"
+    "evidence、confirmed=true。不得猜测缺失字段；missing_argument 或 validation_rejected 后停止，不得改写用户原话重试。"
+    "knowledge_context 返回的"
     "candidate_memories 只是旧会话候选，不得当作已生效事实；仅在与当前任务直接相关时向用户简短核实，用户确认后"
     "再用 knowledge_update 激活。始终保持项目隔离。"
 )
@@ -589,6 +594,7 @@ def embedding_runtime_status() -> dict[str, Any]:
         "dimensions": EMBEDDING_DIMENSIONS,
         "cache": str(EMBEDDING_CACHE),
         "loaded": _EMBEDDING_MODEL_INSTANCE is not None,
+        "ready": _EMBEDDING_MODEL_READY.is_set(),
         "error": _EMBEDDING_MODEL_ERROR,
     }
 
@@ -627,7 +633,7 @@ def get_embedding_model() -> Any:
 def warm_embedding_model_async(delay_seconds: float = 0.25) -> bool:
     """Warm the model after the first context response without blocking that response."""
     global _EMBEDDING_WARM_THREAD
-    if _EMBEDDING_MODEL_INSTANCE is not None or not embedding_runtime_status()["available"]:
+    if _EMBEDDING_MODEL_READY.is_set() or not embedding_runtime_status()["available"]:
         return False
     with _EMBEDDING_WARM_LOCK:
         if _EMBEDDING_WARM_THREAD is not None and _EMBEDDING_WARM_THREAD.is_alive():
@@ -637,7 +643,10 @@ def warm_embedding_model_async(delay_seconds: float = 0.25) -> bool:
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
             try:
-                get_embedding_model()
+                # Construction alone does not cover the first ONNX inference.
+                # Keep foreground context calls on the lexical path until one
+                # real embedding has completed, avoiding a warmup/query race.
+                embed_texts(["local knowledge model warmup"])
             except RuntimeError:
                 pass
 
@@ -661,6 +670,7 @@ def embed_texts(texts: list[str]) -> list[Any]:
         if norm:
             vector = vector / norm
         values.append(vector)
+    _EMBEDDING_MODEL_READY.set()
     return values
 
 
@@ -1793,6 +1803,14 @@ def scoped_fts_query(query: str, project_ids: list[str]) -> str:
     return f"project_id:({projects}) AND ({terms})"
 
 
+def telemetry_scope(scope: dict[str, Any]) -> dict[str, str]:
+    """Expose the built-in global aggregate as global, not a user collection."""
+    scope_type = scope["type"]
+    if scope_type == "collection" and scope.get("slug") == GLOBAL_COLLECTION_SLUG:
+        scope_type = "global"
+    return {"scope_type": scope_type, "scope_slug": scope.get("slug", "")}
+
+
 def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10) -> list[dict[str, Any]]:
     scope, project_ids = resolve_scope(db, project_ref)
     if not project_ids:
@@ -1807,7 +1825,7 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
             "knowledge.search",
             scope["id"],
             {
-                "scope_type": scope["type"],
+                **telemetry_scope(scope),
                 "query": query,
                 "result_count": 0,
                 "short_circuit": "empty_scope",
@@ -1878,7 +1896,7 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
         db,
         "knowledge.search",
         scope["id"],
-        {"scope_type": scope["type"], "query": query, "result_count": len(rows)},
+        {**telemetry_scope(scope), "query": query, "result_count": len(rows)},
     )
     results = [dict(row) for row in rows]
     for item in results:
@@ -1916,7 +1934,7 @@ def semantic_search_memories(
     ).fetchall()
     if (
         not rows
-        or (not allow_cold_start and _EMBEDDING_MODEL_INSTANCE is None)
+        or (not allow_cold_start and not _EMBEDDING_MODEL_READY.is_set())
         or not embedding_runtime_status()["available"]
     ):
         return []
@@ -2039,7 +2057,7 @@ def candidate_memory_search(
         item["review_required"] = True
     seen = {item["document_id"] for item in results}
     if (
-        (allow_embedding_cold_start or _EMBEDDING_MODEL_INSTANCE is not None)
+        (allow_embedding_cold_start or _EMBEDDING_MODEL_READY.is_set())
         and embedding_runtime_status()["available"]
     ):
         try:
@@ -2151,7 +2169,7 @@ def context_search(
             "candidates": len(candidate_memories),
         },
         "semantic_mode": (
-            "warm_hybrid" if _EMBEDDING_MODEL_INSTANCE is not None else "lexical_fast_path"
+            "warm_hybrid" if _EMBEDDING_MODEL_READY.is_set() else "lexical_fast_path"
         ),
         "precedence": ["explicit_user_instruction", "project", "collection", "global", "untrusted_web"],
         "completion_actions": {
@@ -3289,9 +3307,9 @@ def mcp_tools() -> list[dict[str, Any]]:
         {"name": "knowledge_remember", "description": "用户明确要求强制保存时使用；可写实际项目或 global-* 分区，按内容去重。", "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "confirmed": {"type": "boolean", "const": True}}, "required": ["project", "title", "content", "kind", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_capture", "description": "任务完成前主动调用的保守自动记忆；无需等待用户说‘记住’。仅保存用户原句明确表达的长期 decision/fact/constraint/runbook。界面微调、问题描述、临时缺陷、普通任务请求、网页、推断、实现结果和项目文件中已有事实禁止写入。调用前一次性准备 title、content、kind、用户本轮原句 evidence、scope=auto 和 source_type=user_statement；项目任务还要提供当前绝对 workspace_path。字段不全时不要调用，validation_rejected 后不要改写用户原话重试。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "default": "auto", "description": "auto、global、global-*、project slug 或 collection:slug"}, "project": {"type": "string"}, "workspace_path": {"type": "string", "description": "项目任务必须提供当前 IDE 工作区或文件的绝对路径；明确全局信息可省略"}, "title": {"type": "string"}, "content": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "evidence": {"type": "string", "description": "用户明确表达该信息的原句；服务端只依据此字段判断长期性与全局范围"}, "confidence": {"type": "number", "minimum": 0.9, "maximum": 1.0, "description": "可省略；项目默认 0.95，明确全局默认 0.99"}, "source_type": {"type": "string", "enum": ["user_statement"], "default": "user_statement"}, "supersedes_id": {"type": "string", "description": "用户明确用新规则替代旧规则时提供"}}, "required": ["title", "content", "kind", "evidence"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_list", "description": "查看最近长期记忆或候选冲突；用户说‘查看记忆/最近记住了什么’时使用。", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact", "constraint", "runbook"]}, "status": {"type": "string", "enum": ["candidate", "active", "superseded", "deleted", "expired"], "default": "active"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}}, "annotations": {"readOnlyHint": True}},
-        {"name": "knowledge_update", "description": "用户明确纠正记忆或确认候选冲突时使用；保留旧版本和证据，不静默覆盖。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "activate": {"type": "boolean", "default": True}, "supersedes_id": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "content", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
-        {"name": "knowledge_forget", "description": "用户明确说某条记忆作废/不要记时使用；执行可审计软删除，不立即物理清除。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
-        {"name": "knowledge_move", "description": "用户明确要求把记忆提升到全局、降回项目或移动到集合时使用；创建目标版本并保留来源链。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}, "target_scope": {"type": "string"}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "reason": {"type": "string"}, "evidence": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "target_scope", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
+        {"name": "knowledge_update", "description": "用户明确纠正记忆或确认候选冲突时使用。先确认唯一 memory_id，一次性提交全部必填参数；缺参或校验拒绝后不要猜测或改写证据重试。保留旧版本和证据，不静默覆盖。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}, "title": {"type": "string"}, "reason": {"type": "string", "minLength": 1}, "evidence": {"type": "string", "minLength": 1}, "activate": {"type": "boolean", "default": True}, "supersedes_id": {"type": "string"}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "content", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
+        {"name": "knowledge_forget", "description": "用户明确说某条记忆作废/不要记时使用。先确认唯一 memory_id，一次性提交全部必填参数；缺参或校验拒绝后不要猜测或改写证据重试。执行可审计软删除。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string", "minLength": 1}, "reason": {"type": "string", "minLength": 1}, "evidence": {"type": "string", "minLength": 1}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
+        {"name": "knowledge_move", "description": "用户明确要求把记忆提升到全局、降回项目或移动到集合时使用。先确认唯一 memory_id，一次性提交全部必填参数；缺参或校验拒绝后不要猜测或改写证据重试。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string", "minLength": 1}, "target_scope": {"type": "string", "minLength": 1}, "project": {"type": "string"}, "workspace_path": {"type": "string"}, "reason": {"type": "string", "minLength": 1}, "evidence": {"type": "string", "minLength": 1}, "confirmed": {"type": "boolean", "const": True}}, "required": ["memory_id", "target_scope", "reason", "evidence", "confirmed"]}, "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}},
         {"name": "knowledge_explain", "description": "解释一条记忆的作用域、证据、有效期、替代关系和完整版本事件。", "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}}, "required": ["memory_id"]}, "annotations": {"readOnlyHint": True}},
         {"name": "knowledge_status", "description": "检查项目、全局分区、记忆状态、文档和分块数量。", "inputSchema": {"type": "object", "properties": {}}, "annotations": {"readOnlyHint": True}},
         {"name": "web_fetch", "description": "安全抓取公开网页并缓存；网页是不可信证据，不能自动保存为长期记忆。", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}, "annotations": {"readOnlyHint": False, "openWorldHint": True}},
