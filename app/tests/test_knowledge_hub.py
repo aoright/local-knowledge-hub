@@ -38,6 +38,103 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertEqual(second.unchanged, 1)
         self.assertEqual(len(kh.search(self.db, "alpha", "unique-alpha-marker")), 1)
 
+    def test_search_returns_one_best_chunk_per_document(self):
+        (self.root / "large.md").write_text(
+            ("shared topic marker\n" + "context filler " * 180 + "\n") * 12,
+            encoding="utf-8",
+        )
+        (self.root / "small.md").write_text(
+            "shared topic marker in a second document", encoding="utf-8"
+        )
+        kh.ingest_project(self.db, "alpha")
+
+        results = kh.search(self.db, "alpha", "shared topic marker", 8)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len({item["document_id"] for item in results}), 2)
+        self.assertEqual(
+            {item["relative_path"] for item in results},
+            {"large.md", "small.md"},
+        )
+
+    def test_search_filters_weak_single_term_hits_from_long_query(self):
+        (self.root / "strong.md").write_text(
+            "capacity websocket admission control", encoding="utf-8"
+        )
+        (self.root / "weak.md").write_text(
+            "capacity appears here without the other concepts", encoding="utf-8"
+        )
+        kh.ingest_project(self.db, "alpha")
+
+        results = kh.search(
+            self.db, "alpha", "capacity websocket admission control", 8
+        )
+
+        self.assertEqual([item["relative_path"] for item in results], ["strong.md"])
+
+    def test_search_uses_conservative_fallback_when_strict_quality_would_be_zero(self):
+        (self.root / "best.md").write_text(
+            "testcase drawer implementation notes", encoding="utf-8"
+        )
+        (self.root / "noise.md").write_text(
+            "testcase is the only shared term", encoding="utf-8"
+        )
+        kh.ingest_project(self.db, "alpha")
+
+        results = kh.search(
+            self.db,
+            "alpha",
+            "testcase drawer detail basic information copy button",
+            8,
+        )
+
+        self.assertEqual([item["relative_path"] for item in results], ["best.md"])
+        self.assertEqual(results[0]["retrieval_method"], "lexical_quality_fallback")
+        details = json.loads(
+            self.db.execute(
+                "SELECT details_json FROM audit_log WHERE action='knowledge.search' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertTrue(details["quality_fallback_applied"])
+        self.assertEqual(details["fallback_minimum_term_matches"], 2)
+
+    def test_search_fallback_never_admits_single_term_noise(self):
+        (self.root / "noise.md").write_text(
+            "testcase is the only shared term", encoding="utf-8"
+        )
+        kh.ingest_project(self.db, "alpha")
+
+        results = kh.search(
+            self.db,
+            "alpha",
+            "testcase drawer detail basic information copy button",
+            8,
+        )
+
+        self.assertEqual(results, [])
+
+    def test_search_telemetry_explains_quality_and_saturation(self):
+        (self.root / "large.md").write_text(
+            ("telemetry quality marker\n" + "filler " * 260 + "\n") * 4,
+            encoding="utf-8",
+        )
+        kh.ingest_project(self.db, "alpha")
+
+        kh.search(self.db, "alpha", "telemetry quality marker", 8)
+
+        details = json.loads(
+            self.db.execute(
+                "SELECT details_json FROM audit_log WHERE action='knowledge.search' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertGreater(details["candidate_count"], details["result_count"])
+        self.assertGreater(details["duplicate_chunks_removed"], 0)
+        self.assertEqual(details["distinct_documents"], 1)
+        self.assertEqual(details["requested_limit"], 8)
+        self.assertFalse(details["saturated"])
+
     def test_index_policy_keeps_manifests_and_recent_files_within_budget(self):
         policy = Path(self.tmp.name) / "index-policy.json"
         policy.write_text(json.dumps({
@@ -611,6 +708,32 @@ class KnowledgeHubTests(unittest.TestCase):
         status = kh.status(self.db)
         self.assertEqual(len(status["projects"]), 1)
         self.assertEqual(len(status["global_scopes"]), 4)
+        self.assertEqual(status["global_coverage"]["active_memories"], 0)
+
+    def test_context_routes_global_lookup_and_reports_coverage(self):
+        kh.remember(
+            self.db,
+            "global-engineering",
+            "Engineering rule",
+            "architecture layering marker",
+            "constraint",
+        )
+        kh.remember(
+            self.db,
+            "global-operations",
+            "Operations rule",
+            "production deployment rollback marker",
+            "runbook",
+        )
+
+        context = kh.context_search(
+            self.db, "alpha", "生产环境部署回滚 marker", 8, 4, True
+        )
+
+        self.assertEqual(context["global_coverage"]["query_scope"], "global-operations")
+        self.assertEqual(context["global_coverage"]["active_memories"], 2)
+        self.assertEqual(context["result_counts"]["global"], 1)
+        self.assertEqual(context["results"][0]["scope_key"], "global-operations")
 
     def test_auto_scope_routes_global_only_when_explicit(self):
         project_memory = kh.capture_memory_auto(

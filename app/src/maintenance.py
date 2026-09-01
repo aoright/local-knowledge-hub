@@ -84,8 +84,8 @@ def prune_backups(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Preview or apply exact, mode-aware backup retention targets."""
-    if full_retain < 1 or critical_retain < 1:
-        raise ValueError("每种备份至少保留 1 份")
+    if full_retain < 0 or critical_retain < 1:
+        raise ValueError("完整备份保留数不得小于 0，关键备份至少保留 1 份")
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     groups = {
         "full": (
@@ -864,6 +864,7 @@ def health() -> dict:
             if project.get("index_over_budget")
         ],
         "project_health": current_status["project_health"],
+        "global_coverage": current_status["global_coverage"],
         "memory_status": current_status["memory_status"],
         "memory_quality": current_status["memory_quality"],
         "memory_embeddings": current_status["memory_embeddings"],

@@ -1783,7 +1783,7 @@ def ingest_project(db: sqlite3.Connection, project_ref: str) -> IngestStats:
 
 
 def fts_query(query: str) -> str:
-    terms = query_terms(query)
+    terms = search_query_terms(query)
     if not terms:
         raise ValueError("搜索词为空")
     return " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:20])
@@ -1793,6 +1793,85 @@ def query_terms(query: str) -> list[str]:
     return list(dict.fromkeys(
         re.findall(r"[\w\-./\u3400-\u9fff]+", query, re.UNICODE)
     ))[:20]
+
+
+LOCAL_SEARCH_STOPWORDS = WEB_SEARCH_STOPWORDS | {
+    "be", "it", "this", "that", "these", "those",
+}
+
+
+def search_query_terms(query: str) -> list[str]:
+    """Return meaningful terms for project search without broad stopword hits."""
+    raw_terms = query_terms(query)
+    meaningful = [
+        term for term in raw_terms
+        if term.casefold() not in LOCAL_SEARCH_STOPWORDS
+    ]
+    return meaningful or raw_terms
+
+
+def minimum_lexical_matches(term_count: int) -> int:
+    """Require more evidence for long OR queries while preserving short lookups."""
+    if term_count <= 2:
+        return 1
+    return min(4, max(2, (term_count * 3 + 9) // 10))
+
+
+def rank_lexical_rows(
+    rows: Iterable[sqlite3.Row],
+    query: str,
+    limit: int,
+    minimum_matches_override: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Filter weak OR matches and return one best chunk per document."""
+    row_list = list(rows)
+    terms = [term.casefold() for term in search_query_terms(query)]
+    minimum_matches = (
+        minimum_matches_override
+        if minimum_matches_override is not None
+        else minimum_lexical_matches(len(terms))
+    )
+    ranked: list[tuple[int, int, float, int, dict[str, Any]]] = []
+    quality_filtered = 0
+    best_term_matches = 0
+    for original_rank, row in enumerate(row_list):
+        item = dict(row)
+        title_path = "\n".join(
+            str(item.get(key) or "") for key in ("title", "relative_path")
+        ).casefold()
+        searchable = f"{title_path}\n{str(item.get('content') or '').casefold()}"
+        matched = sum(term in searchable for term in terms)
+        best_term_matches = max(best_term_matches, matched)
+        if matched < minimum_matches:
+            quality_filtered += 1
+            continue
+        title_path_matches = sum(term in title_path for term in terms)
+        score = item.get("score")
+        ranked.append(
+            (-matched, -title_path_matches, float(score) if score is not None else 0.0,
+             original_rank, item)
+        )
+
+    ranked.sort(key=lambda entry: entry[:4])
+    results: list[dict[str, Any]] = []
+    seen_documents: set[str] = set()
+    duplicate_chunks = 0
+    for _, _, _, _, item in ranked:
+        document_id = item["document_id"]
+        if document_id in seen_documents:
+            duplicate_chunks += 1
+            continue
+        seen_documents.add(document_id)
+        results.append(item)
+    return results[:limit], {
+        "candidate_count": len(row_list),
+        "quality_filtered_count": quality_filtered,
+        "duplicate_chunks_removed": duplicate_chunks,
+        "distinct_documents": len(seen_documents),
+        "minimum_term_matches": minimum_matches,
+        "query_term_count": len(terms),
+        "best_term_matches": best_term_matches,
+    }
 
 
 def scoped_fts_query(query: str, project_ids: list[str]) -> str:
@@ -1815,6 +1894,8 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
     scope, project_ids = resolve_scope(db, project_ref)
     if not project_ids:
         return []
+    requested_limit = max(1, min(limit, 50))
+    candidate_limit = min(200, requested_limit * 3)
     placeholders = ",".join("?" for _ in project_ids)
     if not db.execute(
         f"SELECT 1 FROM chunks WHERE project_id IN ({placeholders}) LIMIT 1",
@@ -1828,6 +1909,10 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
                 **telemetry_scope(scope),
                 "query": query,
                 "result_count": 0,
+                "requested_limit": requested_limit,
+                "candidate_count": 0,
+                "distinct_documents": 0,
+                "saturated": False,
                 "short_circuit": "empty_scope",
             },
         )
@@ -1851,14 +1936,14 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
           ))
         ORDER BY score LIMIT ?
         """,
-        (scoped_fts_query(query, project_ids), *project_ids, utcnow(), max(1, min(limit, 50))),
+        (scoped_fts_query(query, project_ids), *project_ids, utcnow(), candidate_limit),
     ).fetchall()
     retrieval_method = "lexical"
     if not rows:
         # unicode61 does not split unspaced CJK phrases into useful word tokens.
         # A project-scoped substring fallback keeps Chinese filenames and PDF
         # headings searchable without expanding into another project's corpus.
-        terms = [term.casefold() for term in query_terms(query) if len(term) >= 2]
+        terms = [term.casefold() for term in search_query_terms(query) if len(term) >= 2]
         if terms:
             term_conditions: list[str] = []
             term_values: list[str] = []
@@ -1885,20 +1970,65 @@ def search(db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10
                     mr.status='active' AND mr.valid_to IS NULL
                     AND (mr.expires_at IS NULL OR mr.expires_at>?)
                   ))
-                GROUP BY c.document_id
                 ORDER BY d.modified_at DESC
                 LIMIT ?
                 """,
-                (*project_ids, *term_values, utcnow(), max(1, min(limit, 50))),
+                (*project_ids, *term_values, utcnow(), candidate_limit),
             ).fetchall()
             retrieval_method = "substring"
+    results, quality = rank_lexical_rows(rows, query, requested_limit)
+    fallback_applied = False
+    strict_minimum = quality["minimum_term_matches"]
+    if (
+        not results
+        and rows
+        and quality["query_term_count"] >= 3
+        and quality["best_term_matches"] >= 2
+    ):
+        # Preserve strict matching by default, but do not turn a useful multi-term
+        # candidate set into a false zero-hit.  The fallback only admits the best
+        # evidence tier, still requires two distinct terms, and is intentionally
+        # capped so the caller gets a small reviewable result set.
+        fallback_minimum = max(
+            2,
+            min(strict_minimum - 1, quality["best_term_matches"]),
+        )
+        results, fallback_quality = rank_lexical_rows(
+            rows,
+            query,
+            min(requested_limit, 3),
+            minimum_matches_override=fallback_minimum,
+        )
+        if results:
+            fallback_applied = True
+            retrieval_method = f"{retrieval_method}_quality_fallback"
+            quality = {
+                **quality,
+                "fallback_minimum_term_matches": fallback_minimum,
+                "fallback_result_count": len(results),
+                "fallback_quality_filtered_count": fallback_quality[
+                    "quality_filtered_count"
+                ],
+                "fallback_duplicate_chunks_removed": fallback_quality[
+                    "duplicate_chunks_removed"
+                ],
+                "distinct_documents": fallback_quality["distinct_documents"],
+            }
     telemetry_audit(
         db,
         "knowledge.search",
         scope["id"],
-        {**telemetry_scope(scope), "query": query, "result_count": len(rows)},
+        {
+            **telemetry_scope(scope),
+            "query": query,
+            "result_count": len(results),
+            "requested_limit": requested_limit,
+            "retrieval_method": retrieval_method,
+            "quality_fallback_applied": fallback_applied,
+            "saturated": len(results) >= requested_limit,
+            **quality,
+        },
     )
-    results = [dict(row) for row in rows]
     for item in results:
         item["retrieval_method"] = retrieval_method
     return results
@@ -1990,15 +2120,12 @@ def hybrid_scope_search(
         return lexical
 
     # Reciprocal-rank fusion keeps exact code/file matches strong while allowing
-    # a differently worded long-term memory to surface. Memory entries dedupe by
-    # document; ordinary code chunks retain their own rank.
-    fused: dict[tuple[str, str], dict[str, Any]] = {}
+    # a differently worded long-term memory to surface. Every source dedupes by
+    # document so one large file cannot crowd out the rest of the context.
+    fused: dict[str, dict[str, Any]] = {}
     for source, items in (("lexical", lexical), ("semantic", semantic)):
         for rank, item in enumerate(items, start=1):
-            key = (
-                item["document_id"],
-                "memory" if item.get("source_type") == "memory" else item.get("content", ""),
-            )
+            key = item["document_id"]
             if key not in fused:
                 fused[key] = {**item, "_fusion_score": 0.0, "_methods": set()}
             fused[key]["_fusion_score"] += 1.0 / (60.0 + rank)
@@ -2130,10 +2257,11 @@ def context_search(
             "explicit_collection" if scope["type"] == "collection" else "current_project"
         )
     global_results: list[dict[str, Any]] = []
+    global_query_scope = classify_global_scope(query)
     if include_global and scope["type"] != "global":
         global_results = hybrid_scope_search(
             db,
-            f"collection:{GLOBAL_COLLECTION_SLUG}",
+            global_query_scope,
             query,
             global_limit,
             allow_embedding_cold_start=False,
@@ -2142,7 +2270,7 @@ def context_search(
             item["retrieval_reason"] = "global_relevance"
     candidate_project_ids = list(primary_project_ids)
     if include_global and scope["type"] != "global":
-        _, global_project_ids = resolve_scope(db, f"collection:{GLOBAL_COLLECTION_SLUG}")
+        _, global_project_ids = resolve_scope(db, global_query_scope)
         candidate_project_ids.extend(global_project_ids)
     candidate_memories = candidate_memory_search(
         db,
@@ -2151,10 +2279,10 @@ def context_search(
         3,
         allow_embedding_cold_start=False,
     )
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     results: list[dict[str, Any]] = []
     for item in [*primary_results, *global_results]:
-        key = (item["document_id"], item["content"])
+        key = item["document_id"]
         if key in seen:
             continue
         seen.add(key)
@@ -2171,6 +2299,7 @@ def context_search(
         "semantic_mode": (
             "warm_hybrid" if _EMBEDDING_MODEL_READY.is_set() else "lexical_fast_path"
         ),
+        "global_coverage": global_coverage_summary(db, query),
         "precedence": ["explicit_user_instruction", "project", "collection", "global", "untrusted_web"],
         "completion_actions": {
             "memory_review_required": True,
@@ -2463,6 +2592,48 @@ def classify_global_scope(text: str) -> str:
     if OPERATIONS_MARKERS.search(text):
         return "global-operations"
     return "global-engineering"
+
+
+def global_coverage_summary(
+    db: sqlite3.Connection,
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Describe trusted global coverage without activating unreviewed memories."""
+    now = utcnow()
+    rows = db.execute(
+        """
+        SELECT p.slug,
+               SUM(CASE WHEN mr.status='active' AND mr.valid_to IS NULL
+                         AND (mr.expires_at IS NULL OR mr.expires_at>?)
+                        THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN mr.status='candidate' THEN 1 ELSE 0 END) AS candidates
+        FROM projects p
+        LEFT JOIN documents d ON d.project_id=p.id AND d.source_type='memory'
+        LEFT JOIN memory_records mr ON mr.document_id=d.id
+        WHERE p.slug IN ({})
+        GROUP BY p.slug
+        """.format(",".join("?" for _ in GLOBAL_SCOPES)),
+        (now, *GLOBAL_SCOPES),
+    ).fetchall()
+    counts = {
+        row["slug"]: {
+            "active": int(row["active"] or 0),
+            "candidates": int(row["candidates"] or 0),
+        }
+        for row in rows
+    }
+    scopes = {
+        slug: counts.get(slug, {"active": 0, "candidates": 0})
+        for slug in GLOBAL_SCOPES
+    }
+    return {
+        "query_scope": classify_global_scope(query) if query else None,
+        "active_memories": sum(item["active"] for item in scopes.values()),
+        "candidate_memories": sum(item["candidates"] for item in scopes.values()),
+        "covered_scopes": [slug for slug, item in scopes.items() if item["active"]],
+        "empty_scopes": [slug for slug, item in scopes.items() if not item["active"]],
+        "scopes": scopes,
+    }
 
 
 def resolve_memory_target(
@@ -2836,6 +3007,7 @@ def status(db: sqlite3.Connection) -> dict[str, Any]:
             "zero_document_projects": zero_document_projects,
         },
         "global_scopes": global_scopes,
+        "global_coverage": global_coverage_summary(db),
         "collection_memory_scopes": collection_memory_scopes,
         "collections": collections,
         "memory_status": memory_status,

@@ -28,7 +28,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.3.2.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.3.3.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges. The **Enable automatic updates (recommended)** option is selected by
@@ -38,7 +38,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.3.2.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.3.3.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -72,6 +72,14 @@ Core-only installation without Onyx or SearXNG:
 The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
+
+Version 1.3.3 adds a conservative multi-term fallback when strict lexical
+quality filtering would otherwise turn useful candidates into a false zero-hit.
+Global context is routed to the relevant user, engineering, hardware, or
+operations scope and now reports trusted and candidate coverage explicitly.
+Backup maintenance can remove rebuildable full-index archives while retaining
+verified critical backups, and health output includes the same global coverage
+diagnostics used by status checks.
 
 Version 1.3.2 restores the macOS automatic-update LaunchAgent at login and on
 its daily schedule, reports the built-in global supplement as global instead of

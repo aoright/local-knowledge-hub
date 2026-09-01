@@ -69,6 +69,7 @@ class OperationsTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"]["project_count"], 0)
+        self.assertEqual(result["status"]["global_coverage"]["active_memories"], 0)
         self.assertNotIn("projects", result["status"])
 
     def test_maintenance_freshness_uses_index_and_backup_success_files(self):
@@ -423,6 +424,23 @@ class OperationsTests(unittest.TestCase):
             self.assertGreater(preview["reclaimable_bytes"], 0)
             self.assertTrue(applied["applied"])
             self.assertEqual(len(list(backup_dir.glob("*.sqlite3.gz"))), 4)
+
+    def test_backup_pruning_can_remove_all_rebuildable_full_backups(self):
+        with tempfile.TemporaryDirectory() as value:
+            backup_dir = Path(value)
+            for index in range(3):
+                (backup_dir / f"knowledge-hub-2026010{index}T000000Z.sqlite3.gz").write_bytes(
+                    b"full"
+                )
+            critical = backup_dir / "knowledge-hub-critical-20260103T000000Z.sqlite3.gz"
+            critical.write_bytes(b"critical")
+
+            with mock.patch.object(maintenance, "BACKUP_DIR", backup_dir):
+                applied = maintenance.prune_backups(0, 1, apply=True)
+
+            self.assertEqual(applied["remove_count"], 3)
+            self.assertEqual(len(list(backup_dir.glob("knowledge-hub-[0-9]*.sqlite3.gz"))), 0)
+            self.assertTrue(critical.exists())
 
     def test_index_budget_review_is_dry_run_and_requires_explicit_project_to_apply(self):
         with tempfile.TemporaryDirectory() as value:
