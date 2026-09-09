@@ -29,7 +29,7 @@ jobs:
             name="local-knowledge-hub-$platform-$version"
             mkdir -p "staging/$name"
             cp -a Install-Local-Knowledge-Hub.cmd LICENSE MANIFEST.sha256 README.md \
-              THIRD_PARTY_NOTICES.md VERSION app install.ps1 install.sh setup.iss \
+              THIRD_PARTY_NOTICES.md VERSION app docs install.ps1 install.sh setup.iss \
               uninstall.ps1 uninstall.sh "staging/$name/"
           done
           tar -C staging -czf "dist/local-knowledge-hub-macos-$version.tar.gz" \

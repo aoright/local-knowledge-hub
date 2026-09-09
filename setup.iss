@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.3.2"
+  #define MyAppVersion "1.4.0"
 #endif
 
 [Setup]
@@ -43,6 +43,7 @@ Source: "app\*"; DestDir: "{tmp}\LocalKnowledgeHubPackage\app"; Flags: recursesu
 Source: "install.ps1"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "uninstall.ps1"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
+Source: "docs\*"; DestDir: "{tmp}\LocalKnowledgeHubPackage\docs"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "LICENSE"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion
 Source: "VERSION"; DestDir: "{tmp}\LocalKnowledgeHubPackage"; Flags: ignoreversion; AfterInstall: RunInstaller

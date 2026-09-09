@@ -1,8 +1,25 @@
 # Local Knowledge Hub
 
-Local Knowledge Hub gives Codex, Antigravity, and Antigravity IDE one project-isolated local knowledge layer. It indexes project files locally, keeps controlled long-term memory, and optionally provides Onyx and private SearXNG web search.
+Local Knowledge Hub gives Codex and Antigravity one project-isolated local knowledge layer. It indexes project files locally, keeps controlled long-term memory, and optionally provides Onyx and private SearXNG web search. Legacy Antigravity IDE integration remains available as an explicit installer option.
 
 It does **not** synchronize or modify native chat databases.
+
+## What's new in 1.4.0
+
+- Scoped Chinese phrase retries, exact file/requirement-ID match explanations,
+  and explicit empty-result diagnostics.
+- Client-reported task-end memory review receipts, separated into business,
+  maintenance, test and unclassified usage. This is not a native task-end hook.
+- A separate, default-off, owner-approved document reference layer. Historical
+  memory candidates are not automatically promoted.
+- Empty workspaces report that indexing is awaiting content; loaded-code hashes
+  show whether a reconnect is needed.
+- Unified data-root selection, read-only bounded health probes, explicit macOS
+  scheduler errors, Onyx environment propagation, and bounded web decompression.
+
+Reconnect Local Knowledge MCP in Codex and Antigravity after updating to load
+the new tool catalog. See [retrieval and review quality](docs/usage-quality.md)
+for safety boundaries, configuration and rollback controls.
 
 ## Requirements
 
@@ -28,7 +45,7 @@ Clone the repository or download the platform archive from
 
 ### Windows one-click install
 
-Download `LocalKnowledgeHub-Setup-1.3.3.exe` and double-click it. The setup
+Download `LocalKnowledgeHub-Setup-1.4.0.exe` and double-click it. The setup
 wizard lets you choose between the complete installation and the core-only
 installation. It installs for the current user and does not require administrator
 privileges. The **Enable automatic updates (recommended)** option is selected by
@@ -38,7 +55,7 @@ The executable is currently unsigned, so Windows SmartScreen may show an
 unknown-publisher warning. Verify its SHA-256 file from the same GitHub Release
 before running it.
 
-Portable alternative: extract `local-knowledge-hub-windows-1.3.3.zip` and
+Portable alternative: extract `local-knowledge-hub-windows-1.4.0.zip` and
 double-click `Install-Local-Knowledge-Hub.cmd`, or open PowerShell and run:
 
 ```powershell
@@ -71,7 +88,13 @@ Core-only installation without Onyx or SearXNG:
 
 The default macOS location is `~/.local/share/local-knowledge-hub`.
 
-After installation, restart Codex, Antigravity, and Antigravity IDE. New tasks automatically retrieve relevant local project context; no special prompt is required.
+After installation, restart Codex and Antigravity. New tasks automatically retrieve relevant local project context; no special prompt is required.
+
+The installer records one canonical data root in `.knowledge-hub-data-root` and
+uses it consistently for clients, wrappers, indexing, backups, services, and
+updates. When upgrading a legacy installation, a substantially richer existing
+`runtime` database is retained automatically instead of silently creating a
+second empty `data` database.
 
 Version 1.3.3 adds a conservative multi-term fallback when strict lexical
 quality filtering would otherwise turn useful candidates into a false zero-hit.
@@ -175,7 +198,7 @@ macOS:
 ~/.local/share/local-knowledge-hub/bin/knowledge-hub-update set-auto on
 ```
 
-Onyx is available at <http://127.0.0.1:3000>. On first use, create the first account using the generated credentials under `data/config/admin.env` in the installation directory. Do not share this file.
+Onyx is available at <http://127.0.0.1:3000>. On first use, create the first account using the generated credentials under `config/admin.env` inside the selected data root. Do not share this file.
 
 ## Automatic maintenance
 
@@ -191,16 +214,16 @@ Onyx is available at <http://127.0.0.1:3000>. On first use, create the first acc
   `--project <slug>` together with `--apply`. Only the knowledge-hub registration
   is removed; the local directory and its files are never touched.
 - macOS uses per-user LaunchAgents for the same jobs. Index and backup agents also run once at login before their normal interval/calendar schedules. Turning automatic updates off keeps the local job installed but makes it exit before any network request, so it can be re-enabled without reinstalling.
-- Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated.
+- Existing Codex and Antigravity MCP configuration is preserved; only the managed `local-knowledge` entry is added or updated. Obsolete Local Knowledge Hub LaunchAgents from legacy installations are removed only when they point into the same installation directory.
 - Git projects—and collection folders containing multiple Git repositories—use content-sensitive working-tree fingerprints, so unchanged projects avoid repeated full file walks. A full verification scan still runs at least once every 24 hours.
-- Project index budgets default to 25,000 documents, 300,000 chunks, and 4,096 chunks per document. Review them with `python app/src/maintenance.py index-budget-review`. Applying a review requires both an exact `--project <slug>` and `--apply`; a critical backup is created first and project source files are never deleted. Run `compact-index` for a dry-run disk-space check. Actual compaction additionally requires `--apply --confirm-clients-stopped` after all three clients are closed.
+- Project index budgets default to 25,000 documents, 300,000 chunks, and 4,096 chunks per document. Review them with `python app/src/maintenance.py index-budget-review`. Applying a review requires both an exact `--project <slug>` and `--apply`; a critical backup is created first and project source files are never deleted. Run `compact-index` for a dry-run disk-space check. Actual compaction additionally requires `--apply --confirm-clients-stopped` after all configured clients are closed.
 - Daily scheduled backups preserve project registration, collections, long-term memories, history, embeddings, and audit records while omitting rebuildable file indexes and web caches. Existing full backups are retained separately; `maintenance.py backup --mode full` remains available for manual snapshots.
 - MCP initialization and tool calls are recorded locally with client name, success state, and duration. Tool arguments and project contents are not written to the usage audit.
 - Codex automation rules are stored in `~/.codex/AGENTS.md`; Antigravity rules are stored in the official `~/.gemini/GEMINI.md` location. Older managed Antigravity rules are migrated without removing unrelated user instructions.
 
 ## Upgrade
 
-Automatic updates are enabled by default. Use `knowledge-hub-update status` to inspect the setting, `set-auto off|on` to change it, `check` to check without installing, and `install` to update immediately. The updater accepts only the stable GitHub latest Release, restricts downloads to GitHub asset hosts, and requires a matching SHA-256 digest from Release metadata or the companion checksum asset. Manual installation remains supported: extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the `data` directory and generated secrets are retained.
+Automatic updates are enabled by default. Use `knowledge-hub-update status` to inspect the setting, `set-auto off|on` to change it, `check` to check without installing, and `install` to update immediately. The updater accepts only the stable GitHub latest Release, restricts downloads to GitHub asset hosts, and requires a matching SHA-256 digest from Release metadata or the companion checksum asset. Manual installation remains supported: extract a newer release and run the platform installer again. Application files and the virtual environment are updated; the selected data root and generated secrets are retained.
 
 ## Uninstall
 
@@ -222,7 +245,7 @@ The normal uninstall keeps the knowledge database and backups. The purge option 
 
 ## Privacy boundary
 
-- Project databases, memories, embeddings, web caches, credentials, and backups stay under the local `data` directory.
+- Project databases, memories, embeddings, web caches, credentials, and backups stay under the installer-selected local data root.
 - Project retrieval is isolated by project or explicit collection.
 - Web content is marked untrusted and is never automatically promoted to durable memory.
 - The distribution contains no publisher project data or credentials.
