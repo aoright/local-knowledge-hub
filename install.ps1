@@ -5,7 +5,8 @@ param(
     [switch]$NoStart,
     [switch]$SkipPythonDeps,
     [switch]$EnableAutoUpdate,
-    [switch]$NoAutoUpdate
+    [switch]$NoAutoUpdate,
+    [switch]$WithAntigravityIDE
 )
 
 Set-StrictMode -Version Latest
@@ -104,6 +105,11 @@ try {
     throw
 }
 
+if (Test-Path -LiteralPath (Join-Path $packageRoot "docs\usage-quality.md") -PathType Leaf) {
+    $docsRoot = Join-Path $installRoot "docs"
+    New-Item -ItemType Directory -Force -Path $docsRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $packageRoot "docs\usage-quality.md") -Destination (Join-Path $docsRoot "usage-quality.md") -Force
+}
 foreach ($name in @("uninstall.ps1", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
     Copy-Item -LiteralPath (Join-Path $packageRoot $name) -Destination (Join-Path $installRoot $name) -Force
 }
@@ -134,12 +140,23 @@ if ($EnableAutoUpdate) {
 } elseif ($NoAutoUpdate) {
     $managerArgs += "--no-auto-update"
 }
+if ($WithAntigravityIDE) {
+    $managerArgs += "--with-antigravity-ide"
+}
 & $venvPython @managerArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Local client configuration failed."
 }
 
-$env:KHUB_DATA_DIR = Join-Path $installRoot "data"
+$dataRootMarker = Join-Path $installRoot ".knowledge-hub-data-root"
+if (-not (Test-Path -LiteralPath $dataRootMarker -PathType Leaf)) {
+    throw "Installer did not select a knowledge data root."
+}
+$selectedDataRoot = (Get-Content -LiteralPath $dataRootMarker -TotalCount 1).Trim()
+if ([string]::IsNullOrWhiteSpace($selectedDataRoot)) {
+    throw "Installer selected an empty knowledge data root."
+}
+$env:KHUB_DATA_DIR = $selectedDataRoot
 $khub = Join-Path $installRoot "bin\khub.cmd"
 & $khub init | Out-Null
 if ($LASTEXITCODE -ne 0) {
@@ -149,7 +166,14 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "Project discovery failed."
 }
-& $venvPython (Join-Path $installedApp "src\export_mcp_catalog.py") | Out-Null
+$catalogArgs = @((Join-Path $installedApp "src\export_mcp_catalog.py"))
+if ($WithAntigravityIDE) {
+    $catalogArgs += @(
+        (Join-Path $env:USERPROFILE ".gemini\antigravity\mcp\local-knowledge"),
+        (Join-Path $env:USERPROFILE ".gemini\antigravity-ide\mcp\local-knowledge")
+    )
+}
+& $venvPython @catalogArgs | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "MCP catalog export failed."
 }
@@ -169,8 +193,8 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "Installed Local Knowledge Hub at:"
 Write-Host "  $installRoot"
-Write-Host "Restart Codex, Antigravity, and Antigravity IDE to load local-knowledge."
+Write-Host "Restart Codex and Antigravity to load local-knowledge."
 if (-not $WithoutServices) {
     Write-Host "Onyx: http://127.0.0.1:3000"
-    Write-Host "First-account credentials: $(Join-Path $installRoot 'data\config\admin.env')"
+    Write-Host "First-account credentials: $(Join-Path $selectedDataRoot 'config\admin.env')"
 }

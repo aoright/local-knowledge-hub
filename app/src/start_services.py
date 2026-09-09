@@ -16,7 +16,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = Path(os.environ.get("KHUB_DATA_DIR", ROOT / "runtime")).expanduser().resolve()
+INSTALL_ROOT = ROOT.parent if ROOT.name == "app" else ROOT
+
+
+def configured_data_root() -> Path:
+    explicit = os.environ.get("KHUB_DATA_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    marker = INSTALL_ROOT / ".knowledge-hub-data-root"
+    if marker.is_file():
+        try:
+            value = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if value:
+            return Path(value).expanduser().resolve()
+    fallback = INSTALL_ROOT / "data" if ROOT.name == "app" else ROOT / "runtime"
+    return fallback.resolve()
+
+
+DATA_ROOT = configured_data_root()
 SEARCH_CONFIG = Path(
     os.environ.get("KHUB_SEARXNG_CONFIG_DIR", DATA_ROOT / "config" / "searxng")
 ).expanduser().resolve()
@@ -304,11 +323,13 @@ def ensure_docker_runtime() -> str:
     raise RuntimeError("Docker daemon 未运行；请启动 Docker Desktop")
 
 
-def compose_environment() -> dict[str, str]:
+def compose_environment(onyx_env: Path | None = None) -> dict[str, str]:
     environment = os.environ.copy()
     environment["KHUB_SEARXNG_CONFIG_DIR"] = str(
         SEARCH_CONFIG if SEARCH_CONFIG.is_dir() else ROOT / "deploy" / "searxng"
     )
+    if onyx_env is not None:
+        environment["KHUB_ONYX_ENV_PATH"] = str(onyx_env)
     return environment
 
 
@@ -346,7 +367,7 @@ def ensure_services() -> dict[str, object]:
     runtime_action = ensure_docker_runtime()
 
     onyx_env = ONYX_ENV if ONYX_ENV.is_file() else ROOT / "deploy" / ".env"
-    compose_env = compose_environment()
+    compose_env = compose_environment(onyx_env)
     search_compose, onyx_compose, onyx_override = compose_files()
 
     run([
@@ -358,7 +379,7 @@ def ensure_services() -> dict[str, object]:
         "--env-file", str(onyx_env),
         "-f", str(onyx_compose),
         "-f", str(onyx_override), "up", "-d",
-    ])
+    ], env=compose_env)
 
     services = wait_for_services()
     if not all(services.values()):
@@ -384,6 +405,7 @@ def stop_services(purge: bool = False) -> dict[str, object]:
         env=compose_environment(),
     )
     onyx_env = ONYX_ENV if ONYX_ENV.is_file() else ROOT / "deploy" / ".env"
+    compose_env = compose_environment(onyx_env)
     run(
         [
             str(DOCKER),
@@ -397,7 +419,8 @@ def stop_services(purge: bool = False) -> dict[str, object]:
             "-f",
             str(onyx_override),
             *suffix,
-        ]
+        ],
+        env=compose_env,
     )
     return {"action": "stopped", "purged": purge}
 

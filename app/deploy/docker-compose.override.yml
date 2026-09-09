@@ -1,4 +1,13 @@
 services:
+  api_server:
+    env_file:
+      - path: ${KHUB_ONYX_ENV_PATH}
+        required: true
+
+  background:
+    env_file:
+      - path: ${KHUB_ONYX_ENV_PATH}
+        required: true
+
   code-interpreter:
     profiles: ["disabled"]
-

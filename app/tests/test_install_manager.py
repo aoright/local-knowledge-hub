@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,63 @@ SPEC.loader.exec_module(manager)
 
 
 class InstallManagerTests(unittest.TestCase):
+    def test_launchctl_reports_bootstrap_failure(self):
+        failed = mock.Mock(returncode=5, stderr="Input/output error")
+        with (
+            mock.patch.dict(os.environ, {"KHUB_SKIP_LAUNCHCTL": "0"}),
+            mock.patch.object(manager.os, "getuid", return_value=501, create=True),
+            mock.patch.object(manager.subprocess, "run", return_value=failed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bootstrap failed.*exit 5"):
+                manager.launchctl("bootstrap", "/tmp/test.plist")
+            manager.launchctl("bootout", "missing.job")
+
+    @staticmethod
+    def write_inventory_database(
+        data_root: Path,
+        *,
+        projects: int,
+        documents: int,
+        memories: int,
+    ) -> None:
+        data_root.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(data_root / "knowledge-hub.sqlite3")
+        db.executescript(
+            "CREATE TABLE projects(id INTEGER);"
+            "CREATE TABLE documents(id INTEGER);"
+            "CREATE TABLE memory_records(id INTEGER);"
+        )
+        db.executemany("INSERT INTO projects VALUES(?)", [(i,) for i in range(projects)])
+        db.executemany("INSERT INTO documents VALUES(?)", [(i,) for i in range(documents)])
+        db.executemany("INSERT INTO memory_records VALUES(?)", [(i,) for i in range(memories)])
+        db.commit()
+        db.close()
+
+    def test_data_root_prefers_richer_legacy_database_and_persists_choice(self):
+        with tempfile.TemporaryDirectory() as value:
+            install = Path(value)
+            self.write_inventory_database(
+                install / "data", projects=3, documents=20, memories=0
+            )
+            self.write_inventory_database(
+                install / "runtime", projects=30, documents=2_500, memories=8
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                selected = manager.select_data_root(install)
+                manager.persist_data_root(install, selected)
+                selected_again = manager.select_data_root(install)
+        self.assertEqual(selected, (install / "runtime").resolve())
+        self.assertEqual(selected_again, selected)
+
+    def test_explicit_data_root_environment_wins(self):
+        with tempfile.TemporaryDirectory() as value:
+            install = Path(value) / "install"
+            selected = Path(value) / "external-data"
+            with mock.patch.dict(
+                os.environ, {"KHUB_DATA_DIR": str(selected)}, clear=True
+            ):
+                self.assertEqual(manager.select_data_root(install), selected.resolve())
+
     def test_managed_agents_block_preserves_user_content_and_is_idempotent(self):
         original = "# User rules\n\nKeep this.\n"
         first = manager.replace_managed_block(original, manager.INSTRUCTIONS)
@@ -137,6 +195,25 @@ class InstallManagerTests(unittest.TestCase):
             self.assertIn("other", data["mcpServers"])
             self.assertNotIn("local-knowledge", data["mcpServers"])
 
+    def test_antigravity_ide_configuration_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / "home"
+            install = root / "install"
+            data = install / "data"
+            manager.configure_clients(home, install, True, data)
+            ide_config = home / ".gemini" / "antigravity-ide" / "mcp_config.json"
+            self.assertFalse(ide_config.exists())
+
+            manager.configure_clients(
+                home,
+                install,
+                True,
+                data,
+                include_antigravity_ide=True,
+            )
+            self.assertTrue(ide_config.is_file())
+
     def test_initialize_generates_private_unique_configuration(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -189,6 +266,32 @@ class InstallManagerTests(unittest.TestCase):
             )
             backup_payload = plistlib.loads(backup_agent.read_bytes())
             self.assertTrue(backup_payload["RunAtLoad"])
+
+    def test_legacy_launch_agents_are_removed_only_for_same_install(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            home = root / "home"
+            install = root / "install"
+            agents = home / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            matching = agents / f"{manager.LEGACY_MACOS_LABELS[0]}.plist"
+            matching.write_bytes(plistlib.dumps({
+                "Label": manager.LEGACY_MACOS_LABELS[0],
+                "ProgramArguments": [str(install / "src" / "start_services.py")],
+            }))
+            foreign = agents / f"{manager.LEGACY_MACOS_LABELS[1]}.plist"
+            foreign.write_bytes(plistlib.dumps({
+                "Label": manager.LEGACY_MACOS_LABELS[1],
+                "ProgramArguments": ["/another/install/maintenance.py"],
+            }))
+            with mock.patch.object(manager, "launchctl") as launchctl:
+                removed = manager.uninstall_legacy_launch_agents(home, install)
+            self.assertEqual(removed, [str(matching)])
+            self.assertFalse(matching.exists())
+            self.assertTrue(foreign.exists())
+            launchctl.assert_called_once_with(
+                "bootout", manager.LEGACY_MACOS_LABELS[0]
+            )
 
     def test_windows_initialize_writes_native_wrappers_and_mcp_launch(self):
         with tempfile.TemporaryDirectory() as value:

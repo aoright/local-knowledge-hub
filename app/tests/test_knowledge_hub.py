@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,20 @@ SPEC.loader.exec_module(kh)
 
 
 class KnowledgeHubTests(unittest.TestCase):
+    def test_configured_data_root_reads_install_marker(self):
+        with tempfile.TemporaryDirectory() as value:
+            install = Path(value)
+            selected = install / "runtime"
+            (install / ".knowledge-hub-data-root").write_text(
+                str(selected), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(kh, "INSTALL_ROOT", install),
+                mock.patch.object(kh, "ROOT", install / "app"),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(kh.configured_data_root(), selected.resolve())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "project"
@@ -113,6 +128,28 @@ class KnowledgeHubTests(unittest.TestCase):
         )
 
         self.assertEqual(results, [])
+
+    def test_exact_filename_survives_long_query_without_admitting_mentions(self):
+        (self.root / "alert.go").write_text("package alert\n", encoding="utf-8")
+        (self.root / "note.md").write_text("mentions alert.go only", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        query = "告警JSONL日志具备轮转和容量保护 NUNU-DVT-OBS-0033 alert.go"
+        results = kh.search(self.db, "alpha", query, 8)
+        self.assertEqual([r["relative_path"] for r in results], ["alert.go"])
+        self.assertEqual(results[0]["match_basis"], "exact_file_path")
+        self.assertEqual(results[0]["unmatched_identifiers"], ["NUNU-DVT-OBS-0033"])
+        other_root = Path(self.tmp.name) / "other"
+        other_root.mkdir()
+        (other_root / "note.md").write_text("mentions alert.go only", encoding="utf-8")
+        kh.add_project(self.db, "beta", "Beta", str(other_root))
+        kh.ingest_project(self.db, "beta")
+        self.assertEqual(kh.search(self.db, "beta", query), [])
+
+    def test_mixed_han_filename_query_is_split(self):
+        self.assertEqual(
+            kh.query_terms("server.log按日轮转并保留7天"),
+            ["server.log", "按日轮转并保留7天"],
+        )
 
     def test_search_telemetry_explains_quality_and_saturation(self):
         (self.root / "large.md").write_text(
@@ -344,7 +381,8 @@ class KnowledgeHubTests(unittest.TestCase):
         )
         self.assertIn("knowledge_context", [tool["name"] for tool in tools])
         self.assertIn("knowledge_capture", [tool["name"] for tool in tools])
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 14)
+        self.assertIn("knowledge_review", {tool["name"] for tool in tools})
         self.assertIn("knowledge_update", [tool["name"] for tool in tools])
         self.assertIn("knowledge_forget", [tool["name"] for tool in tools])
         self.assertIn("knowledge_move", [tool["name"] for tool in tools])
@@ -546,6 +584,32 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertEqual(details["source"], "arguments")
         self.assertFalse(details["require_git"])
 
+    def test_empty_workspace_is_not_left_as_zero_document_project(self):
+        workspace = Path(self.tmp.name) / "Empty Chat Workspace"
+        workspace.mkdir()
+        value = kh.mcp_call(
+            self.db,
+            "knowledge_context",
+            {"workspace_path": str(workspace), "query": "marker"},
+            client_name="codex-mcp-client",
+        )
+        self.assertNotIn("resolution_required", value)
+        self.assertTrue(value["workspace_status"]["resolved"])
+        self.assertEqual(value["workspace_status"]["index_state"], "awaiting_content")
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM projects WHERE slug='empty-chat-workspace'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM audit_log "
+                "WHERE action='project.auto_registration_skipped'"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_inferred_non_git_workspace_still_fails_closed(self):
         workspace = Path(self.tmp.name) / "Untrusted Folder"
         workspace.mkdir()
@@ -734,6 +798,17 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertEqual(context["global_coverage"]["active_memories"], 2)
         self.assertEqual(context["result_counts"]["global"], 1)
         self.assertEqual(context["results"][0]["scope_key"], "global-operations")
+
+    def test_context_marks_fresh_external_research_as_web_required(self):
+        current = kh.context_search(
+            self.db, "alpha", "搜索全网查找最新 Python 官方文档", 8, 4, True
+        )
+        local = kh.context_search(
+            self.db, "alpha", "解释本地设备离线判断逻辑", 8, 4, True
+        )
+        self.assertTrue(current["web_retrieval"]["required"])
+        self.assertIn("web_search", current["web_retrieval"]["instruction"])
+        self.assertFalse(local["web_retrieval"]["required"])
 
     def test_auto_scope_routes_global_only_when_explicit(self):
         project_memory = kh.capture_memory_auto(
@@ -1066,6 +1141,79 @@ class KnowledgeHubTests(unittest.TestCase):
                 self.db, "alpha", "Web claim", "website-claim-marker is true", "fact",
                 "网页声称 website-claim-marker", 0.99, source_type="web",
             )
+
+    def test_web_fetch_returns_partial_content_after_read_timeout(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers.get_content_type.return_value = "text/html"
+        response.headers.get_content_charset.return_value = "utf-8"
+        response.headers.get.return_value = None
+        response.read.side_effect = [
+            b"<html><title>Official guide</title><body>Useful evidence",
+            TimeoutError("slow response"),
+        ]
+        response.status = 200
+        response.url = "https://example.com/guide"
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+
+        with (
+            mock.patch.object(kh, "validate_public_url"),
+            mock.patch.object(kh.urllib.request, "build_opener", return_value=opener),
+        ):
+            result = kh.fetch_web_page(self.db, "https://example.com/guide")
+
+        self.assertTrue(result["partial"])
+        self.assertIn("Useful evidence", result["content"])
+        self.assertIn("超时", result["warning"])
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM web_cache").fetchone()[0], 1
+        )
+
+    def test_web_fetch_rejects_timeout_before_receiving_content(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers.get_content_type.return_value = "text/html"
+        response.headers.get.return_value = None
+        response.read.side_effect = TimeoutError("slow response")
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+
+        with (
+            mock.patch.object(kh, "validate_public_url"),
+            mock.patch.object(kh.urllib.request, "build_opener", return_value=opener),
+        ):
+            with self.assertRaisesRegex(ValueError, "未收到可解析内容"):
+                kh.fetch_web_page(self.db, "https://example.com/guide")
+
+    def test_web_fetch_decodes_gzip_body_from_proxy(self):
+        html = b"<html><title>Compressed guide</title><body>Readable evidence</body></html>"
+        compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+        encoded = compressor.compress(html) + compressor.flush()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers.get_content_type.return_value = "text/html"
+        response.headers.get_content_charset.return_value = "utf-8"
+        response.headers.get.side_effect = lambda name, default=None: (
+            "gzip" if name == "Content-Encoding" else default
+        )
+        response.read.side_effect = [encoded, b""]
+        response.status = 200
+        response.url = "https://example.com/compressed"
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+
+        with (
+            mock.patch.object(kh, "validate_public_url"),
+            mock.patch.object(kh.urllib.request, "build_opener", return_value=opener),
+        ):
+            result = kh.fetch_web_page(self.db, response.url)
+
+        self.assertEqual(result["title"], "Compressed guide")
+        self.assertIn("Readable evidence", result["content"])
+        self.assertEqual(
+            opener.open.call_args.args[0].get_header("Accept-encoding"), "identity"
+        )
 
     def test_web_search_uses_working_engine_and_rejects_engine_failure(self):
         response = mock.MagicMock()
@@ -1405,6 +1553,29 @@ class KnowledgeHubTests(unittest.TestCase):
         for url in ("http://127.0.0.1/x", "http://localhost/x", "http://[::1]/x"):
             with self.assertRaises(ValueError):
                 kh.validate_public_url(url)
+
+    def test_ssrf_guard_resolves_fake_ip_through_proxy_with_doh_fallback(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "Answer": [{"type": 1, "data": "151.101.0.223"}]
+        }).encode()
+        opener = mock.MagicMock()
+        opener.open.side_effect = [TimeoutError("first provider slow"), response]
+        with (
+            mock.patch.object(
+                kh.socket,
+                "getaddrinfo",
+                return_value=[(kh.socket.AF_INET, kh.socket.SOCK_STREAM, 6, "", ("198.18.0.42", 443))],
+            ),
+            mock.patch.object(kh, "proxy_handler", return_value=mock.MagicMock()),
+            mock.patch.object(kh.urllib.request, "build_opener", return_value=opener),
+        ):
+            parsed = kh.validate_public_url("https://www.python.org/downloads/")
+
+        self.assertEqual(parsed.hostname, "www.python.org")
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertIn("cloudflare-dns.com", opener.open.call_args.args[0].full_url)
 
     def test_parent_project_excludes_nested_project_root(self):
         nested = self.root / "child"

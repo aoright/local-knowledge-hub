@@ -833,14 +833,29 @@ def ingest_all(force: bool = False) -> dict:
 
 
 def health() -> dict:
-    db = kh.connect()
+    db = None
+    current_status = None
+    database_error = None
     try:
-        kh.initialize(db)
+        # Health probes must not initialize/migrate the live database or wait
+        # behind the indexer's writer lock. Never create a missing database.
+        db = sqlite3.connect(
+            Path(kh.DEFAULT_DB).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.5
+        )
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only=ON")
+        deadline = time.monotonic() + 5.0
+        db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-        database = "ok"
         current_status = kh.status(db)
+        current_status["review_coverage"] = kh.review_coverage(db)
+        database = "ok"
+    except sqlite3.Error as exc:
+        database = "error"
+        database_error = str(exc)
     finally:
-        db.close()
+        if db is not None:
+            db.close()
     services = {}
     for name, url in {"onyx": "http://127.0.0.1:3000/api/health", "searxng": "http://127.0.0.1:8888/healthz"}.items():
         try:
@@ -868,10 +883,12 @@ def health() -> dict:
         "memory_status": current_status["memory_status"],
         "memory_quality": current_status["memory_quality"],
         "memory_embeddings": current_status["memory_embeddings"],
-    }
+        "review_coverage": current_status["review_coverage"],
+    } if current_status is not None else {"unavailable": True}
     return {
         "ok": healthy,
         "database": database,
+        "database_error": database_error,
         "services": services,
         "maintenance": maintenance,
         "status": status_summary,

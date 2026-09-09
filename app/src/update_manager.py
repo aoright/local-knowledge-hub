@@ -23,8 +23,25 @@ from typing import Any, Iterator
 APP_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_ROOT = APP_ROOT.parent if APP_ROOT.name == "app" else APP_ROOT
 DEFAULT_DATA_ROOT = INSTALL_ROOT / "data" if APP_ROOT.name == "app" else APP_ROOT / "runtime"
+
+
+def configured_data_root() -> Path:
+    explicit = os.environ.get("KHUB_DATA_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    marker = INSTALL_ROOT / ".knowledge-hub-data-root"
+    if marker.is_file():
+        try:
+            value = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if value:
+            return Path(value).expanduser().resolve()
+    return DEFAULT_DATA_ROOT.resolve()
+
+
 DATA_ROOT = Path(
-    os.environ.get("KHUB_DATA_DIR", DEFAULT_DATA_ROOT)
+    configured_data_root()
 ).expanduser().resolve()
 CONFIG_FILE = DATA_ROOT / "config" / "update.json"
 STATE_FILE = DATA_ROOT / "update-state.json"
@@ -33,6 +50,7 @@ LOCK_FILE = DATA_ROOT / "update.lock"
 VERSION_CANDIDATES = (
     APP_ROOT / "VERSION",
     INSTALL_ROOT / "VERSION",
+    INSTALL_ROOT / "app" / "VERSION",
     APP_ROOT / "packaging" / "VERSION",
     INSTALL_ROOT / "packaging" / "VERSION",
 )

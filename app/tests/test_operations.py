@@ -30,10 +30,74 @@ maintenance = load("maintenance")
 
 
 class OperationsTests(unittest.TestCase):
+    def test_onyx_override_passes_database_credentials_to_application_services(self):
+        override = (
+            Path(__file__).parents[1] / "deploy" / "docker-compose.override.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("api_server:", override)
+        self.assertIn("background:", override)
+        self.assertEqual(override.count("path: ${KHUB_ONYX_ENV_PATH}"), 2)
+        self.assertEqual(override.count("required: true"), 2)
+
+    def test_compose_environment_exposes_private_onyx_env_path(self):
+        onyx_env = Path("/private/config/onyx.env")
+        environment = start.compose_environment(onyx_env)
+        self.assertEqual(environment["KHUB_ONYX_ENV_PATH"], str(onyx_env))
+
+    def test_service_data_root_reads_install_marker(self):
+        with tempfile.TemporaryDirectory() as value:
+            install = Path(value)
+            selected = install / "runtime"
+            (install / ".knowledge-hub-data-root").write_text(
+                str(selected), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(start, "INSTALL_ROOT", install),
+                mock.patch.object(start, "ROOT", install / "app"),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(start.configured_data_root(), selected.resolve())
+
+    def test_project_discovery_skips_empty_and_unsupported_workspaces(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            empty = root / "empty"
+            unsupported = root / "unsupported"
+            supported = root / "supported"
+            empty.mkdir()
+            unsupported.mkdir()
+            supported.mkdir()
+            (unsupported / "archive.bin").write_bytes(b"binary")
+            (supported / "README.md").write_text("project notes", encoding="utf-8")
+            self.assertFalse(discover.path_has_indexable_content(str(empty)))
+            self.assertFalse(discover.path_has_indexable_content(str(unsupported)))
+            self.assertTrue(discover.path_has_indexable_content(str(supported)))
+
+    def test_project_discovery_prunes_only_rechecked_empty_metadata(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            db = maintenance.kh.connect(root / "knowledge.sqlite3")
+            maintenance.kh.initialize(db)
+            maintenance.kh.add_project(db, "first", "First", str(first))
+            maintenance.kh.add_project(db, "second", "Second", str(second))
+            removed = discover.prune_discovered_empty_projects(
+                db, {str(first.resolve())}
+            )
+            remaining = [item["slug"] for item in maintenance.kh.list_projects(db)]
+            db.close()
+        self.assertEqual(removed, ["first"])
+        self.assertEqual(remaining, ["second"])
+
     def test_health_uses_lightweight_probe_and_returns_compact_status(self):
         with tempfile.TemporaryDirectory() as value:
             database_path = Path(value) / "knowledge.sqlite3"
-            real_connect = maintenance.kh.connect
+            writer = maintenance.kh.connect(database_path)
+            maintenance.kh.initialize(writer)
+            writer.execute("BEGIN IMMEDIATE")
 
             class Response:
                 status = 200
@@ -51,8 +115,7 @@ class OperationsTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     maintenance.kh,
-                    "connect",
-                    side_effect=lambda: real_connect(database_path),
+                    "DEFAULT_DB", database_path,
                 ),
                 mock.patch.object(
                     maintenance.urllib.request,
@@ -66,11 +129,27 @@ class OperationsTests(unittest.TestCase):
                 ),
             ):
                 result = maintenance.health()
+            writer.rollback()
+            writer.close()
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"]["project_count"], 0)
         self.assertEqual(result["status"]["global_coverage"]["active_memories"], 0)
         self.assertNotIn("projects", result["status"])
+
+    def test_health_does_not_create_missing_database(self):
+        with tempfile.TemporaryDirectory() as value:
+            missing = Path(value) / "missing.sqlite3"
+            with (
+                mock.patch.object(maintenance.kh, "DEFAULT_DB", missing),
+                mock.patch.object(maintenance.urllib.request, "urlopen", side_effect=OSError("offline")),
+                mock.patch.object(maintenance.service_watchdog, "maintenance_freshness", return_value={}),
+            ):
+                result = maintenance.health()
+            self.assertFalse(missing.exists())
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["database"], "error")
+            self.assertIn("onyx", result["services"])
 
     def test_maintenance_freshness_uses_index_and_backup_success_files(self):
         with tempfile.TemporaryDirectory() as value:

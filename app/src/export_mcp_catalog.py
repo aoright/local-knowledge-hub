@@ -14,7 +14,6 @@ import knowledge_hub as kh
 
 DEFAULT_TARGETS = [
     Path.home() / ".gemini/antigravity/mcp/local-knowledge",
-    Path.home() / ".gemini/antigravity-ide/mcp/local-knowledge",
 ]
 
 

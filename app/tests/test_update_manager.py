@@ -36,6 +36,18 @@ class Response:
 
 
 class UpdateManagerTests(unittest.TestCase):
+    def test_data_root_reads_install_marker_without_wrapper_environment(self):
+        selected = self.root / "runtime"
+        (self.root / ".knowledge-hub-data-root").write_text(
+            str(selected), encoding="utf-8"
+        )
+        with (
+            mock.patch.object(updater, "INSTALL_ROOT", self.root),
+            mock.patch.object(updater, "DEFAULT_DATA_ROOT", self.root / "data"),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertEqual(updater.configured_data_root(), selected.resolve())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
