@@ -59,7 +59,7 @@ def configured_data_root() -> Path:
 DATA_ROOT = configured_data_root()
 DEFAULT_DB = DATA_ROOT / "knowledge-hub.sqlite3"
 LOADED_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-RETRIEVAL_REVISION = "2026-09-08-cjk-diagnostics-v1"
+RETRIEVAL_REVISION = "2026-09-09-review-cjk-v2"
 PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
@@ -68,7 +68,25 @@ def runtime_identity() -> dict[str, Any]:
         disk_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except OSError:
         disk_hash = None
+    try:
+        installed_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        installed_version = None
+    # Version labels alone do not prove that a running process is a release build.
+    expected_hash = None
+    try:
+        for line in (INSTALL_ROOT / "MANIFEST.sha256").read_text(encoding="utf-8").splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2 and parts[1].lstrip("*") == "app/src/knowledge_hub.py":
+                expected_hash = parts[0] if re.fullmatch(r"[0-9a-f]{64}", parts[0]) else None
+    except OSError:
+        pass
     return {
+        "installed_version": installed_version,
+        "package_code_status": "unverified" if expected_hash is None else
+            "matches_manifest" if disk_hash == expected_hash else "locally_modified",
+        "manifest_code_sha256": expected_hash,
+        "version_notice": "安装版本标签、磁盘代码和已加载进程分别核对；代码匹配不代表整包验收通过。",
         "retrieval_revision": RETRIEVAL_REVISION,
         "loaded_code_sha256": LOADED_CODE_SHA256,
         "disk_code_sha256": disk_hash,
@@ -190,7 +208,8 @@ MCP_INSTRUCTIONS = (
     "若 knowledge_context 返回 completion_actions.review_id，任务结束前复核本轮用户原话后调用 "
     "knowledge_review（review_id、workspace_path、outcome、memory_ids）。没有长期信息用 no_durable_information，"
     "已经保存用 captured，重复用 duplicate，需要用户确认用 needs_confirmation；不要为了完成复核而写入记忆。"
-    "复核记录仅是客户端报告，不代表服务端读取了完整会话。维护或验收调用请明确填写 usage_kind=maintenance 或 test。"
+    "复核记录仅是客户端报告，不代表服务端读取了完整会话。每次上下文必须明确填写用途usage_kind：实际开发business，维护/发布maintenance，验收test，不确定才填unclassified。"
+    "最终答复前使用本轮返回的review_call_template，在实际复核后替换outcome占位符并调用knowledge_review；不要补报其他会话或历史任务，不要提前结束仍进行中的任务。"
 )
 
 GLOBAL_SCOPES = {
@@ -1895,6 +1914,9 @@ CJK_RETRIEVAL_PHRASES = (
     "已解决", "下拉框", "刷新按钮", "高度一致", "日志轮转", "容量保护",
     "指标重置", "服务重启", "权限管理", "访问控制", "审计日志", "设备离线",
     "电源设计", "连接资料", "接口请求", "请求失败", "错误提示", "重试机制",
+    "工时", "用例", "脚本", "缺陷", "创建人", "运行者", "归属", "结算",
+    "自动创建", "执行批次", "撤销", "恢复", "流水", "数据库", "仲裁引擎",
+    "喂食", "掉落", "衣柜",
 )
 
 
@@ -1913,7 +1935,11 @@ def cjk_rewrite_query(query: str) -> str | None:
     if len(selected) < 2:
         return None
     identifiers = re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-\d+(?:-\d+)*\b", query)
-    terms = list(dict.fromkeys([*identifiers, *selected]))[:8]
+    protected = [term for term in query_terms(query)
+                 if re.search(r"[A-Za-z]", term) and re.search(r"[_./]", term)]
+    terms = list(dict.fromkeys([*identifiers, *protected, *selected]))
+    if len(terms) > 20:
+        return None  # Do not silently truncate constraints to force a retry.
     rewritten = " ".join(terms)
     return rewritten if search_query_terms(rewritten) != search_query_terms(query) else None
 
@@ -2021,6 +2047,7 @@ def search(
     db: sqlite3.Connection, project_ref: str, query: str, limit: int = 10,
     *, diagnostics: dict[str, Any] | None = None, allow_rewrite: bool = True,
     emit_telemetry: bool = True,
+    phrase_retry: bool = False,
 ) -> list[dict[str, Any]]:
     started = time.monotonic()
     details = diagnostics if diagnostics is not None else {}
@@ -2080,6 +2107,8 @@ def search(
         (scoped_fts_query(query, project_ids), *project_ids, utcnow(), candidate_limit),
     ).fetchall()
     retrieval_method = "lexical"
+    if phrase_retry:
+        rows = []  # unicode61 hits for common words must not hide CJK substrings.
     if not rows:
         # unicode61 does not split unspaced CJK phrases into useful word tokens.
         # A project-scoped substring fallback keeps Chinese filenames and PDF
@@ -2106,7 +2135,7 @@ def search(
                 JOIN projects p ON p.id=c.project_id
                 LEFT JOIN memory_records mr ON mr.document_id=d.id
                 WHERE c.project_id IN ({placeholders})
-                  AND ({' OR '.join(term_conditions)})
+                  AND ({' + '.join(term_conditions) if phrase_retry else ' OR '.join(term_conditions)}) >= {max(2, (len(terms) + 1) // 2) if phrase_retry else 1}
                   AND (d.source_type!='memory' OR (
                     mr.status='active' AND mr.valid_to IS NULL
                     AND (mr.expires_at IS NULL OR mr.expires_at>?)
@@ -2161,11 +2190,19 @@ def search(
         # Exactly one retry within the already resolved scope. Do not double count
         # a retry as another client search in audit statistics.
         retry = search(db, project_ref, rewritten, min(requested_limit, 3),
-                       diagnostics=rewrite_diagnostics, allow_rewrite=False, emit_telemetry=False)
+                       diagnostics=rewrite_diagnostics, allow_rewrite=False, emit_telemetry=False,
+                       phrase_retry=True)
         identifiers = re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-\d+(?:-\d+)*\b", query)
         phrases = [term for term in search_query_terms(rewritten) if re.search(r"[\u3400-\u9fff]", term)]
+        protected = [term for term in query_terms(query)
+                     if re.search(r"[A-Za-z]", term) and re.search(r"[_./]", term)]
         results = [item for item in retry if
-            sum(term in (str(item.get("title", "")) + str(item.get("content", ""))) for term in phrases) >= 2
+            sum(term in (str(item.get("title", "")) + str(item.get("content", ""))) for term in phrases) >= max(2, (len(phrases) + 1) // 2)
+            and all(term in (str(item.get("title", "")) + str(item.get("content", "")))
+                    for term in ("工时", "仲裁引擎") if term in query)
+            and all(term.casefold() in (str(item.get("title", "")) + "\n" +
+                    str(item.get("relative_path", "")) + "\n" + str(item.get("content", ""))).casefold()
+                    for term in protected)
             and (not identifiers or any(
                 re.search(r"(?<![\w-])" + re.escape(identifier) + r"(?![\w-])",
                           str(item.get("content", "")), re.IGNORECASE)
@@ -2286,7 +2323,10 @@ def hybrid_scope_search(
         allow_cold_start=allow_embedding_cold_start,
     )
     if diagnostics is not None:
+        diagnostics["lexical_result_count"] = len(lexical)
+        diagnostics["lexical_no_results_reason"] = diagnostics.get("no_results_reason")
         diagnostics["semantic_result_count"] = len(semantic)
+        diagnostics["semantic_only_fallback"] = bool(semantic) and not lexical
         if semantic:
             diagnostics["no_results_reason"] = None
     if not semantic:
@@ -2579,7 +2619,19 @@ def begin_review(
         "review_tool": "knowledge_review" if recorded else None,
         "review_reporting": "client_reported_not_native_hook",
         "review_instruction": "复核用户原话后报告 no_durable_information/captured/duplicate/needs_confirmation；没有信息不要为了填数写记忆。",
+        "review_call_template": {
+            "review_id": review_id if recorded else None,
+            "workspace_path": details["workspace_path"],
+            "outcome": "SELECT_AFTER_REVIEW",
+            "memory_ids": [],
+        } if recorded else None,
+        "review_execution_rule": "在本轮最终答复之前复核并调用 knowledge_review；模板 outcome 必须按实际复核结果填写。只完成本轮 review_id，不替其他会话或历史任务补报。任务仍在执行时不提交结束回执。",
     })
+    value["usage_classification"] = {
+        "value": usage_kind, "source": "arguments" if "usage_kind" in args else "missing",
+        "needs_classification": usage_kind == "unclassified",
+        "instruction": "下次上下文调用明确填写用途：实际开发business，系统检查/发布maintenance，验收test；无法确定才用unclassified。不得根据项目名称自动猜测。",
+    }
     value["runtime"] = runtime_identity()
     value["usage_kind"] = usage_kind
     return value
@@ -2632,14 +2684,26 @@ def complete_review(db: sqlite3.Connection, args: dict[str, Any], client: str | 
 
 def review_coverage(db: sqlite3.Connection) -> dict[str, Any]:
     rows = db.execute(
-        "SELECT action,details_json FROM audit_log WHERE action IN ('review.requested','review.completed') "
+        "SELECT event_at,action,details_json FROM audit_log WHERE action IN ('review.requested','review.completed') "
         "AND event_at>=strftime('%Y-%m-%dT%H:%M:%S','now','-7 days') ORDER BY id"
     ).fetchall()
     requested, completed = {}, {}
     for row in rows:
         d = json.loads(row["details_json"])
+        d["event_at"] = row["event_at"]
         (requested if row["action"] == "review.requested" else completed)[d["review_id"]] = d
     matched = {key: value for key, value in completed.items() if key in requested}
+    by_client = {}
+    unreported_age = {"under_2h": 0, "2h_to_24h": 0, "over_24h": 0}
+    now = datetime.now(timezone.utc)
+    for key, request in requested.items():
+        client = request.get("client", "unknown")
+        bucket = by_client.setdefault(client, {"requested": 0, "reported": 0, "not_reported": 0})
+        bucket["requested"] += 1
+        bucket["reported" if key in matched else "not_reported"] += 1
+        if key not in matched:
+            age = max(0, (now - datetime.fromisoformat(request["event_at"])).total_seconds())
+            unreported_age["under_2h" if age < 7200 else "2h_to_24h" if age < 86400 else "over_24h"] += 1
     by_usage_kind = {}
     for kind in ("business", "maintenance", "test", "unclassified"):
         ids = {key for key, value in requested.items() if value.get("usage_kind", "unclassified") == kind}
@@ -2649,6 +2713,9 @@ def review_coverage(db: sqlite3.Connection) -> dict[str, Any]:
         "window_days": 7, "requested": len(requested), "reported": len(matched),
         "not_reported": len(set(requested) - set(matched)),
         "by_usage_kind": by_usage_kind,
+        "by_client": by_client,
+        "unreported_age": unreported_age,
+        "task_completion_observable": False,
         "outcomes": {outcome: sum(d["outcome"] == outcome for d in matched.values()) for outcome in
                      ("no_durable_information", "captured", "duplicate", "needs_confirmation")},
         "notice": "总计包含验收与维护，请按 by_usage_kind 区分真实业务。未报告可能是任务进行中、客户端未复核或断开；不等于漏存。报告来自客户端，不证明完整会话已被服务端审查。",
@@ -3945,9 +4012,10 @@ def mcp_tools() -> list[dict[str, Any]]:
     })
     for tool in tools:
         if tool["name"] == "knowledge_context":
+            tool["inputSchema"]["required"].append("usage_kind")
             tool["inputSchema"]["properties"]["usage_kind"] = {
                 "type": "string", "enum": ["business", "maintenance", "test", "unclassified"],
-                "default": "unclassified", "description": "业务/维护/验收测试；未提供时保持未分类，不推断为真实业务使用",
+                "description": "必填：实际开发business，系统维护/发布maintenance，验收test；确实无法确定才填unclassified。旧客户端省略时服务仍兼容但会提示补齐。",
             }
     return tools
 
@@ -4169,6 +4237,7 @@ def mcp_server(db_path: Path) -> None:
                         "result_counts": value.get("result_counts") if isinstance(value, dict) else None,
                         "scope_slug": (value.get("scope") or {}).get("slug") if isinstance(value, dict) else None,
                         "semantic_mode": value.get("semantic_mode") if isinstance(value, dict) else None,
+                        "primary_retrieval": value.get("retrieval_diagnostics", {}).get("primary") if isinstance(value, dict) else None,
                         "outcome": "resolution_required"
                         if isinstance(value, dict) and value.get("resolution_required")
                         else "awaiting_content" if isinstance(value, dict) and value.get("workspace_status", {}).get("index_state") == "awaiting_content"

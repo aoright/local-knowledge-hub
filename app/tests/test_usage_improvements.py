@@ -140,6 +140,88 @@ class UsageImprovementsTests(unittest.TestCase):
         tool = next(tool for tool in kh.mcp_tools() if tool["name"] == "knowledge_review")
         self.assertEqual(tool["inputSchema"]["required"], ["review_id", "workspace_path", "outcome"])
 
+    def test_review_template_is_current_scoped_and_not_an_automatic_outcome(self):
+        context = self.context(usage_kind="unclassified")
+        template = context["completion_actions"]["review_call_template"]
+        self.assertEqual(template["review_id"], context["completion_actions"]["review_id"])
+        self.assertEqual(template["workspace_path"], str(self.root.resolve()))
+        self.assertTrue(context["usage_classification"]["needs_classification"])
+        with self.assertRaises(ValueError):
+            kh.complete_review(self.db, template, "test-client")
+        coverage = kh.review_coverage(self.db)
+        self.assertEqual(coverage["by_client"]["test-client"]["not_reported"], 1)
+        self.assertEqual(coverage["unreported_age"]["under_2h"], 1)
+        self.assertFalse(coverage["task_completion_observable"])
+        self.assertEqual(coverage["reported"], 0)
+
+    def test_catalog_requires_usage_but_legacy_calls_are_not_misclassified(self):
+        tool = next(t for t in kh.mcp_tools() if t["name"] == "knowledge_context")
+        self.assertIn("usage_kind", tool["inputSchema"]["required"])
+        value = kh.mcp_call(self.db, "knowledge_context", {
+            "workspace_path": str(self.root), "query": "legacy"
+        }, "old-client")
+        self.assertEqual(value["usage_kind"], "unclassified")
+        self.assertEqual(value["usage_classification"]["source"], "missing")
+
+    def test_morning_cjk_queries_have_literal_scoped_retry(self):
+        queries = [
+            "创建缺陷工时自动审计体系及配置与部署",
+            "用例详情运行脚本工时结算与缺陷创建人归属及脚本错误过滤",
+            "用例详情单用例运行脚本 自动创建缺陷 记录运行者为创建人 工时奖励 自动化执行批次不计工时 脚本问题不计工时",
+            "工时撤销未生效 撤销恢复 重新同步 数据库恢复 工时流水撤销机制",
+            "系统智能仲裁引擎 自动工时记录归属",
+        ]
+        (self.root / "guide.md").write_text(
+            "工时、用例、脚本、缺陷、创建人、运行者、归属、结算、自动创建、执行批次、撤销、恢复、流水、数据库、仲裁引擎",
+            encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertIsNotNone(kh.cjk_rewrite_query(query))
+                results = kh.search(self.db, "alpha", query)
+                self.assertTrue(results)
+                self.assertEqual(results[0]["relative_path"], "guide.md")
+
+    def test_cjk_retry_keeps_machine_identifiers_and_rejects_weak_match(self):
+        (self.root / "guide.md").write_text("喂食与掉落有关，工时与脚本有关", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        query = "喂食掉落 wardrobe_items accessory_templates user_clothing"
+        retry = kh.cjk_rewrite_query(query)
+        self.assertIn("wardrobe_items", retry)
+        self.assertEqual(kh.search(self.db, "alpha", query), [])
+
+    def test_workhour_retry_rejects_generic_testcase_defect_pages(self):
+        (self.root / "noise.md").write_text("用例、缺陷、脚本、创建人、归属", encoding="utf-8")
+        (self.root / "good.md").write_text("用例的脚本结算需要核对工时、缺陷与创建人归属", encoding="utf-8")
+        kh.ingest_project(self.db, "alpha")
+        results = kh.search(self.db, "alpha", "用例详情运行脚本工时结算与缺陷创建人归属及脚本错误过滤")
+        self.assertEqual([r["relative_path"] for r in results], ["good.md"])
+
+    def test_semantic_fallback_keeps_lexical_zero_reason(self):
+        diagnostic = {}
+        with mock.patch.object(kh, "semantic_search_memories", return_value=[{
+            "document_id": "memory-test", "semantic_score": .8, "content": "memory only"
+        }]):
+            results = kh.hybrid_scope_search(self.db, "alpha", "no document", 3, diagnostics=diagnostic)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(diagnostic["lexical_result_count"], 0)
+        self.assertEqual(diagnostic["lexical_no_results_reason"], "empty_scope")
+        self.assertTrue(diagnostic["semantic_only_fallback"])
+
+    def test_version_label_does_not_hide_modified_code(self):
+        package = Path(self.tmp.name) / "package"
+        app = package / "app"
+        app.mkdir(parents=True)
+        (app / "VERSION").write_text("1.4.0")
+        with mock.patch.object(kh, "ROOT", app), mock.patch.object(kh, "INSTALL_ROOT", package):
+            self.assertEqual(kh.runtime_identity()["package_code_status"], "unverified")
+            (package / "MANIFEST.sha256").write_text("0" * 64 + "  app/src/knowledge_hub.py\n")
+            identity = kh.runtime_identity()
+            self.assertEqual(identity["installed_version"], "1.4.0")
+            self.assertEqual(identity["package_code_status"], "locally_modified")
+            (package / "MANIFEST.sha256").write_text(kh.LOADED_CODE_SHA256 + "  app/src/knowledge_hub.py\n")
+            self.assertEqual(kh.runtime_identity()["package_code_status"], "matches_manifest")
+
 
 if __name__ == "__main__":
     unittest.main()

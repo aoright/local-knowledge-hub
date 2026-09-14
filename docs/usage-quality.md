@@ -78,8 +78,10 @@ The rollout does not populate this allowlist or activate historical candidates.
 
 ## Usage and versions
 
-Clients may set `usage_kind` to `business`, `maintenance`, or `test`. The default
-is `unclassified`, never an assumed business call. MCP audit events include
+New tool catalogs require `usage_kind`: `business`, `maintenance`, `test`, or
+`unclassified` only when genuinely unknown. Legacy callers that omit it remain
+compatible and receive a classification notice; no business use is inferred.
+MCP audit events include
 scope, result counts, review ID, semantic mode and the loaded code hash. Search
 events include duration and the retrieval revision. Keep tool calls distinct
 from project/global searches and distinguish nonempty results from relevance.
@@ -89,6 +91,27 @@ The loaded hash is fixed at module import; updating a file does not pretend to
 hot-reload an old process. Older processes without these fields have unknown
 loaded revisions until reconnected. `native_task_end_hook=false` describes this
 integration, not the full capabilities of any third-party client.
+
+The review response includes a `review_call_template` with the current ID and
+workspace. Its outcome placeholder must be replaced after actually reviewing
+the current user statements. It is not a default no-information receipt.
+Coverage includes per-client counts and unreported age buckets; age never
+implies that a task ended or memory was lost. Historical receipts are not filled
+by a later task.
+
+Retrieval diagnostics preserve `lexical_result_count` and
+`lexical_no_results_reason` even when semantic memory produces a nonempty final
+result (`semantic_only_fallback`). MCP telemetry includes primary diagnostics,
+so this distinction no longer requires guessing from a final hit count.
+The literal phrase vocabulary now covers work hours, script execution, defect
+ownership and reversal. Retries retain code identifiers and file paths; they
+remain scoped, bounded and evidence-filtered, not general Chinese understanding.
+
+Installers preserve the release `MANIFEST.sha256`. Runtime reports the installed
+version label separately from `package_code_status`: `matches_manifest`,
+`locally_modified`, or `unverified` when no valid baseline exists. This checks
+the gateway source only, not full package integrity. Never bump a version label
+alone to claim an upgrade; deploy the package, verify its files and reconnect.
 
 An empty new workspace now returns `workspace_status.index_state=awaiting_content`
 without a project-resolution error. It does not leave an empty project in the

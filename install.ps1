@@ -113,6 +113,9 @@ if (Test-Path -LiteralPath (Join-Path $packageRoot "docs\usage-quality.md") -Pat
 foreach ($name in @("uninstall.ps1", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
     Copy-Item -LiteralPath (Join-Path $packageRoot $name) -Destination (Join-Path $installRoot $name) -Force
 }
+if (Test-Path -LiteralPath (Join-Path $packageRoot "MANIFEST.sha256")) {
+    Copy-Item -LiteralPath (Join-Path $packageRoot "MANIFEST.sha256") -Destination (Join-Path $installRoot "MANIFEST.sha256") -Force
+}
 
 $venvPython = Join-Path $installRoot "venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {

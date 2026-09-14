@@ -373,7 +373,7 @@ class KnowledgeHubTests(unittest.TestCase):
         self.assertIn("validation_rejected", capture_tool["description"])
         context_tool = next(tool for tool in tools if tool["name"] == "knowledge_context")
         self.assertEqual(
-            context_tool["inputSchema"]["required"], ["query", "workspace_path"]
+            context_tool["inputSchema"]["required"], ["query", "workspace_path", "usage_kind"]
         )
         self.assertEqual(
             context_tool["inputSchema"]["properties"]["workspace_path"]["minLength"],

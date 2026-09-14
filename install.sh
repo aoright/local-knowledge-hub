@@ -81,6 +81,9 @@ if [ -f "$PACKAGE_ROOT/docs/usage-quality.md" ]; then
 fi
 /bin/cp "$PACKAGE_ROOT/LICENSE" "$INSTALL_ROOT/LICENSE"
 /bin/cp "$PACKAGE_ROOT/THIRD_PARTY_NOTICES.md" "$INSTALL_ROOT/THIRD_PARTY_NOTICES.md"
+if [ -f "$PACKAGE_ROOT/MANIFEST.sha256" ]; then
+  /bin/cp "$PACKAGE_ROOT/MANIFEST.sha256" "$INSTALL_ROOT/MANIFEST.sha256"
+fi
 chmod 700 "$INSTALL_ROOT/uninstall.sh"
 
 if [ ! -x "$INSTALL_ROOT/venv/bin/python3" ]; then
