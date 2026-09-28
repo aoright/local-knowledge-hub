@@ -1,5 +1,11 @@
 # Local Knowledge Hub
 
+[![CI](https://github.com/aoright/local-knowledge-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/aoright/local-knowledge-hub/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)](#requirements)
+[![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-green.svg)](https://modelcontextprotocol.io/)
+
 Local Knowledge Hub gives Codex and Antigravity one project-isolated local knowledge layer. It indexes project files locally, keeps controlled long-term memory, and optionally provides Onyx and private SearXNG web search. Legacy Antigravity IDE integration remains available as an explicit installer option.
 
 It does **not** synchronize or modify native chat databases.
@@ -252,12 +258,9 @@ The normal uninstall keeps the knowledge database and backups. The purge option 
 
 ## License
 
-Local Knowledge Hub integration code is source-available under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). Personal, research,
-educational, charitable, and other noncommercial use is permitted under that
-license. Commercial use requires separate permission from the licensor.
+Local Knowledge Hub integration code is open source under the
+[MIT License](LICENSE).
 
-This is a noncommercial source-available license, not an OSI-approved open
-source license. The included Onyx deployment material remains under Onyx's own
+The included Onyx deployment material remains under Onyx's own
 license; see `app/vendor/onyx/LICENSE`. Other dependencies retain their own
 licenses; see `THIRD_PARTY_NOTICES.md`.
