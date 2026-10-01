@@ -96,6 +96,80 @@ The default macOS location is `~/.local/share/local-knowledge-hub`.
 
 After installation, restart Codex and Antigravity. New tasks automatically retrieve relevant local project context; no special prompt is required.
 
+## Client Configuration
+
+Local Knowledge Hub exposes a Model Context Protocol (MCP) server that connects to coding assistants and AI engines.
+
+### Cursor Configuration
+
+Add `local-knowledge` to your Cursor MCP configuration (`~/.cursor/mcp.json` or **Cursor Settings** -> **Features** -> **MCP**):
+
+#### macOS (`~/.cursor/mcp.json`)
+```json
+{
+  "mcpServers": {
+    "local-knowledge": {
+      "command": "/Users/<username>/.local/share/local-knowledge-hub/venv/bin/python",
+      "args": [
+        "/Users/<username>/.local/share/local-knowledge-hub/app/src/knowledge_hub.py",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+#### Windows (`%APPDATA%\Cursor\mcp.json`)
+```json
+{
+  "mcpServers": {
+    "local-knowledge": {
+      "command": "C:\\Users\\<username>\\AppData\\Local\\LocalKnowledgeHub\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\<username>\\AppData\\Local\\LocalKnowledgeHub\\app\\src\\knowledge_hub.py",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+### Claude Desktop Configuration
+
+Add `local-knowledge` to your Claude Desktop configuration file:
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+#### macOS (`claude_desktop_config.json`)
+```json
+{
+  "mcpServers": {
+    "local-knowledge": {
+      "command": "/Users/<username>/.local/share/local-knowledge-hub/venv/bin/python",
+      "args": [
+        "/Users/<username>/.local/share/local-knowledge-hub/app/src/knowledge_hub.py",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+#### Windows (`claude_desktop_config.json`)
+```json
+{
+  "mcpServers": {
+    "local-knowledge": {
+      "command": "C:\\Users\\<username>\\AppData\\Local\\LocalKnowledgeHub\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\<username>\\AppData\\Local\\LocalKnowledgeHub\\app\\src\\knowledge_hub.py",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
 The installer records one canonical data root in `.knowledge-hub-data-root` and
 uses it consistently for clients, wrappers, indexing, backups, services, and
 updates. When upgrading a legacy installation, a substantially richer existing

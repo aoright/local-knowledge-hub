@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-knowledge-hub"
+version = "1.4.0"
+description = "Project-isolated local knowledge layer and MCP server for AI coding tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Local Knowledge Hub Authors" }
+]
+dependencies = [
+    "fastembed>=0.8.0",
+    "pypdf>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["app"]

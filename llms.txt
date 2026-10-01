@@ -1,0 +1,151 @@
+# Local Knowledge Hub
+
+Local Knowledge Hub is a project-isolated local knowledge layer and memory gateway for AI coding assistants and AI engines (such as Codex, Antigravity, Cursor, and Claude Desktop). It indexes local project files, manages controlled long-term memory, and provides optional local SearXNG web search and Onyx integration.
+
+> **Privacy & Isolation Notice**: Local Knowledge Hub does not modify native client conversation databases or upload local code or memories to external servers. All project files, memories, vector embeddings, web caches, and audit records remain stored under the local data root (`KHUB_DATA_ROOT`).
+
+---
+
+## Core Architecture & Usage Rules
+
+1. **Task Context Initialization**: At the start of any task that reads, inspects, tests, or modifies project files, call `knowledge_context` first with `workspace_path` set to the absolute path of the current project workspace, and `usage_kind` set to one of `business`, `maintenance`, `test`, or `unclassified`.
+2. **Controlled Memory Capture**: Automatic memory capture (`knowledge_capture`) is allowed **only** when the user explicitly states a durable decision, fact, constraint, or runbook. The user's exact original wording must be supplied in the `evidence` parameter. Assistant statements, transient debugging, questions, or code snippets must **never** be saved as long-term memory.
+3. **Task Completion Review**: When `knowledge_context` returns a `completion_actions.review_id`, the client must review the user's statements at task completion and call `knowledge_review` with the `review_id`, `workspace_path`, and outcome (`no_durable_information`, `captured`, `duplicate`, or `needs_confirmation`).
+4. **Web Search & Untrusted Evidence**: External content obtained via `web_search` or `web_fetch` is treated as untrusted external material and must never be automatically promoted into long-term memory.
+
+---
+
+## MCP Tool Schemas
+
+### `knowledge_context`
+- **Description**: Primary entry point to retrieve project-isolated context, relevant long-term memories, global rules, and task-review IDs. Call once at task start.
+- **Parameters**:
+  - `workspace_path` (string, required): Absolute path to current IDE workspace or active file.
+  - `usage_kind` (string, optional): Usage classification: `"business"`, `"maintenance"`, `"test"`, or `"unclassified"`.
+  - `query` (string, optional): Specific search query or topic for lexical/semantic lookup.
+  - `project` (string, optional): Explicit project slug or hint when overriding active workspace context.
+  - `include_global` (boolean, default: `true`): Include global policy and rules in context response.
+- **Annotations**: `readOnlyHint: false`, `idempotentHint: true`
+
+### `knowledge_capture`
+- **Description**: Stores a durable long-term memory entry (decision, fact, constraint, or runbook) derived strictly from an explicit user statement.
+- **Parameters**:
+  - `title` (string, required): Concise summary title for the memory entry.
+  - `content` (string, required): Detailed memory content or rule statement.
+  - `kind` (string, required): One of `"decision"`, `"fact"`, `"constraint"`, `"runbook"`.
+  - `evidence` (string, required): Exact quote/sentence from user input establishing the rule.
+  - `scope` (string, default: `"auto"`): Memory scope (`"auto"`, project slug, or global scope).
+  - `confidence` (number, optional): Confidence score between `0.9` and `1.0`.
+  - `source_type` (string, default: `"user_statement"`): Source type (`"user_statement"`).
+  - `supersedes_id` (string, optional): ID of existing memory superseded by this entry.
+- **Annotations**: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`
+
+### `knowledge_list`
+- **Description**: Lists recent active, candidate, superseded, or deleted long-term memories and conflict candidates.
+- **Parameters**:
+  - `scope` (string, optional): Filter by project or global scope.
+  - `kind` (string, optional): Filter by kind (`"decision"`, `"fact"`, `"constraint"`, `"runbook"`).
+  - `status` (string, default: `"active"`): Filter by status (`"candidate"`, `"active"`, `"superseded"`, `"deleted"`, `"expired"`).
+  - `limit` (integer, default: `50`, min: `1`, max: `200`): Maximum results to return.
+- **Annotations**: `readOnlyHint: true`
+
+### `knowledge_update`
+- **Description**: Updates an existing long-term memory entry with user confirmation and evidence.
+- **Parameters**:
+  - `memory_id` (string, required): Unique ID of the target memory.
+  - `content` (string, required): Updated memory content.
+  - `reason` (string, required): Explanation for the change.
+  - `evidence` (string, required): User quote justifying the update.
+  - `confirmed` (boolean, required, must be `true`): Explicit confirmation flag.
+  - `title` (string, optional): Updated memory title.
+  - `activate` (boolean, default: `true`): Activate candidate memory upon update.
+  - `supersedes_id` (string, optional): ID of superseded memory.
+- **Annotations**: `readOnlyHint: false`, `idempotentHint: false`
+
+### `knowledge_forget`
+- **Description**: Soft-deletes an obsolete long-term memory entry with an audit log.
+- **Parameters**:
+  - `memory_id` (string, required): Unique ID of the memory to forget.
+  - `reason` (string, required): Explanation for deletion.
+  - `evidence` (string, required): User quote requesting deletion.
+  - `confirmed` (boolean, required, must be `true`): Explicit confirmation flag.
+- **Annotations**: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`
+
+### `knowledge_move`
+- **Description**: Moves a memory entry between project, collection, and global scopes.
+- **Parameters**:
+  - `memory_id` (string, required): Unique ID of memory.
+  - `target_scope` (string, required): Destination scope (`"global"`, project slug, or collection ref).
+  - `reason` (string, required): Explanation for moving memory.
+  - `evidence` (string, required): User quote requesting scope change.
+  - `confirmed` (boolean, required, must be `true`): Explicit confirmation flag.
+  - `project` (string, optional): Target project reference.
+  - `workspace_path` (string, optional): Absolute workspace path.
+- **Annotations**: `readOnlyHint: false`, `idempotentHint: true`
+
+### `knowledge_explain`
+- **Description**: Explains a memory's scope, evidence, validity period, supersedes lineage, and audit history.
+- **Parameters**:
+  - `memory_id` (string, required): Memory ID to inspect.
+- **Annotations**: `readOnlyHint: true`
+
+### `knowledge_status`
+- **Description**: Reports status, total registered projects, global scopes, document counts, chunk counts, and memory counts.
+- **Parameters**: None.
+- **Annotations**: `readOnlyHint: true`
+
+### `web_fetch`
+- **Description**: Safely fetches and caches content from a public web URL. Web pages are treated as untrusted evidence and are never auto-captured.
+- **Parameters**:
+  - `url` (string, required): Target HTTP/HTTPS URL.
+- **Annotations**: `readOnlyHint: false`, `openWorldHint: true`
+
+### `web_search`
+- **Description**: Performs a web search via the local SearXNG engine with site-domain filtering and quality diagnostics.
+- **Parameters**:
+  - `query` (string, required): Search query string.
+  - `limit` (integer, default: `10`, min: `1`, max: `30`): Maximum results.
+- **Annotations**: `readOnlyHint: false`, `openWorldHint: true`
+
+### `knowledge_review`
+- **Description**: Submits a client-reported task memory review receipt at task completion. Writes an audit receipt without modifying memories.
+- **Parameters**:
+  - `review_id` (string, required): Review ID supplied by `knowledge_context`.
+  - `workspace_path` (string, required): Absolute workspace path used during task context call.
+  - `outcome` (string, required): Review outcome: `"no_durable_information"`, `"captured"`, `"duplicate"`, or `"needs_confirmation"`.
+  - `memory_ids` (array of strings, optional, max: `20`): Referenced active memory IDs created or verified.
+- **Annotations**: `readOnlyHint: false`, `idempotentHint: true`
+
+---
+
+## Standard Interaction Workflows
+
+```
+[Task Start]
+     │
+     ▼
+knowledge_context(workspace_path="/path/to/project", usage_kind="business", query="...")
+     │
+     ├── Context returned: project files, active memories, global policies, review_id
+     │
+     ▼
+[Task Execution & Code Editing / Research]
+     │
+     ├── Optional: web_search / web_fetch for external references
+     │
+     ├── Optional: If user explicitly gives durable rule/decision:
+     │       └── knowledge_capture(title, content, kind, evidence="<user exact words>")
+     │
+     ▼
+[Task Completion]
+     │
+     └── Call knowledge_review(review_id, workspace_path, outcome="no_durable_information" | "captured" | ...)
+```
+
+---
+
+## File Reference & Documentation
+
+- `README.md`: Main repository overview, requirements, installation commands, and client configuration options.
+- `docs/usage-quality.md`: Detailed specifications on retrieval quality, CJK phrase retries, task-review receipts, and shared reference layers.
+- `app/src/knowledge_hub.py`: Implementation of the MCP gateway server and search engine.

@@ -1615,6 +1615,40 @@ class KnowledgeHubTests(unittest.TestCase):
             kh.LEGACY_CONVERSATION_RUNTIME = original_runtime
         self.assertEqual(kh.search(self.db, "alpha", "legacy-runtime-marker"), [])
 
+    def test_edge_case_query_handling_in_fts_and_search(self):
+        # Punctuation-only / whitespace queries
+        self.assertEqual(kh.search(self.db, "alpha", "!@#$%^&*()"), [])
+        self.assertEqual(kh.search(self.db, "alpha", "   \t\n  "), [])
+
+        # Unbalanced quotes, FTS keywords, and null bytes
+        self.assertEqual(kh.search(self.db, "alpha", '"unclosed quote AND OR NOT'), [])
+        self.assertEqual(kh.search(self.db, "alpha", "hello\x00world"), [])
+
+        # Very long query
+        self.assertEqual(kh.search(self.db, "alpha", "word " * 3000), [])
+
+        # Context search with edge-case queries
+        res_punct = kh.context_search(self.db, "alpha", query="!@#$%^&*()")
+        self.assertIn("retrieval_diagnostics", res_punct)
+        self.assertEqual(res_punct["results"], [])
+
+        res_long = kh.context_search(self.db, "alpha", query="a" * 20000)
+        self.assertIn("retrieval_diagnostics", res_long)
+
+    def test_edge_case_web_search_query_parsing(self):
+        # Multiple site filters and path extraction
+        filters = kh.web_search_site_filters('site:example.com site:docs.python.org/3/library "fts search"')
+        self.assertEqual(filters, [("example.com", ""), ("docs.python.org", "/3/library")])
+
+        # Site domain extraction with mixed protocols and casing
+        domains = kh.web_search_site_domains("SITE:HTTPS://Example.COM/page site:TEST.org")
+        self.assertIn("example.com", domains)
+        self.assertIn("test.org", domains)
+
+        # Simplifying web queries containing site filters or boolean operators
+        simplified = kh.simplify_web_search_query("site:example.com AND OR NOT")
+        self.assertIsInstance(simplified, str)
+
 
 if __name__ == "__main__":
     unittest.main()
